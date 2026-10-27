@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# 运行数据 —— 这些是跑起来才会有的东西，不该进仓库
+tasks.jsonl
+results.jsonl
+outbox.jsonl
+ask.jsonl
+progress_live.jsonl
+.progress.json
+.progress.json.tmp
+.session_id
+.session_id.bak-*
+*.jsonl.tmp
+
+# 备份
+*.bak
+*.bak-*
+*.orig
+*.rej
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地配置（可能含 key 或私有路径）
+.env
+.env.*
+local.*.yml
