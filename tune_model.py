@@ -1,27 +1,31 @@
-"""调整电脑端那个我用的模型和推理强度。
+"""切换任务端（电脑端）那个我用的模型。
 
-为什么需要这个
-    电脑端跑的每一个任务，用的模型和推理强度是固定的：
-        model: deepseek-v4.1-flash
-        reasoningEffort: max
+为什么模型和 provider 要绑在一起切
+    电脑端的模型不是独立存在的，它挂在某条"通道"上：
 
-    max 意味着它每次都往死里想。简单的活（建个文件）也这样，
-    又慢又费 token。而复杂的活（改代码、查问题）又需要它想清楚。
+        codebuddy 通道     → deepseek-v4.1-flash / deepseek-v4-pro
+                             （省钱，但有每日额度，且看不了图）
+        deepseek-official  → deepseek-flash
+                             （按量付费，没额度，能看图）
 
-    所以应该能按活的大小调：小事用 medium，大事才用 max。
+    所以光改 model 不改 provider，dsh 会报"这个通道没有这个模型"。
+    这个工具用"预设"把两者绑在一起，一次切对。
 
-怎么调的
-    改 $DSH_HOME/profiles/qqme/cordis.patch.yml（或用 DSH_PROFILE_FILE 指定）里的两行：
-        model:            deepseek-v4.1-flash  /  deepseek-v4-pro
-        reasoningEffort:  low / medium / high / max
+怎么用
+    python tune_model.py show                        # 看现在用什么
+    python tune_model.py options                     # 列出所有预设
+    python tune_model.py set --preset cb-flash       # 切到 codebuddy 4.1-flash
+    python tune_model.py set --preset cb-pro         # 切到 codebuddy 4-pro
+    python tune_model.py set --preset official-flash # 切回官方 API
+    python tune_model.py set --effort max            # 只调推理强度（仅 codebuddy 认）
 
     每次 `dsh qqme` 都是新进程，会重新读这个文件，
-    所以改完**不用重启任何服务**，下一个任务立刻生效。
+    所以改完不用重启任何服务，下一个任务立刻生效。
 
-⚠️ 只改这两行，别碰别的。
-    这个文件里还有人格提示词（personaPrefix）那一大段，
-    改坏了电脑端那个我就变味了。所以这里用精确替换，
-    不是整份重写 YAML（那会把注释和格式全冲掉）。
+⚠️ 只改这个文件里自己的两段，别碰别的。
+    人格提示词（personaPrefix）那一大段也在这个文件里，
+    改坏了电脑端那个我就变味了。这里只重建文件头的注释和
+    agent-default-model 那一个块，其余原样保留。
 """
 
 from __future__ import annotations
@@ -34,12 +38,9 @@ import shutil
 import sys
 from datetime import datetime
 
-def _profile_path() -> str:
-    """定位 qqme 的 profile 配置文件。
 
-    优先用环境变量 DSH_PROFILE_FILE 指定；否则按 DSH_HOME 拼默认位置。
-    开源版不能把某台机器的用户名路径写死。
-    """
+def _profile_path() -> str:
+    """定位 qqme 的 profile 配置文件。"""
     env = os.environ.get("DSH_PROFILE_FILE", "").strip()
     if env:
         return env
@@ -49,21 +50,64 @@ def _profile_path() -> str:
 
 PROFILE = _profile_path()
 
-# 可选的模型。加新模型时先确认 llm-codebuddy 的 models 列表里有它，
-# 不然 dsh 会报 model unavailable。
-MODELS = {
-    "deepseek-v4.1-flash": "快，日常够用（默认）",
-    "deepseek-v4-pro": "强，慢一些，适合复杂的活",
+# ----------------------------------------------------------------------
+# 预设：provider + model 绑在一起
+# ----------------------------------------------------------------------
+
+PRESETS = {
+    "cb-flash": {
+        "provider": "codebuddy",
+        "model": "deepseek-v4.1-flash",
+        "effort_default": "high",
+        "label": "codebuddy 4.1-flash — 省钱，日常够用；有每日额度，看不了图",
+    },
+    "cb-pro": {
+        "provider": "codebuddy",
+        "model": "deepseek-v4-pro",
+        "effort_default": "high",
+        "label": "codebuddy 4-pro — 省钱且更强、更慢；同样有每日额度、看不了图",
+    },
+    "official-flash": {
+        "provider": "deepseek-official",
+        "model": "deepseek-flash",
+        "effort_default": "",
+        "label": "官方 API deepseek-flash — 按量付费，没有每日额度，能看图",
+    },
 }
 
-# ⚠️ 这里没有 medium —— 实测 deepseek-v4.1-flash 不支持它。
+# 兼容旧叫法：直接给模型名也能认出是哪个预设
+MODEL_TO_PRESET = {
+    "deepseek-v4.1-flash": "cb-flash",
+    "deepseek-v4-pro": "cb-pro",
+    "deepseek-flash": "official-flash",
+}
+
+# ⚠️ 没有 medium —— 实测 deepseek-v4.1-flash 不支持它。
 #    设成 medium 会报 UNSUPPORTED_REASONING_EFFORT，整个任务白跑。
-#    low / high / max 三个都实测可用。
 EFFORTS = {
     "low": "几乎不想，最快，适合搬砖活",
-    "high": "认真想",
-    "max": "往死里想，最慢也最费（默认）",
+    "high": "认真想（默认）",
+    "max": "往死里想，最慢也最费",
 }
+
+# 文件头的注释也按预设重写，不然切完通道，注释还写着旧通道的理由
+_HEADER_CB = """# qqme：headless 运行时，用 codebuddy 模型 + 我的人格
+#
+# 为什么用 codebuddy：
+#   · 省钱——走 CodeBuddy 订阅，不烧官方 API 的按量费用
+#   · 代价：有每日额度上限，超了任务会哑；这条通道看不了图
+# 额度用完或要看图时，切到官方：
+#   python tune_model.py set --preset official-flash
+"""
+
+_HEADER_OFFICIAL = """# qqme：headless 运行时，用官方 DeepSeek（按量付费） + 我的人格
+#
+# 为什么用官方：
+#   · 没有每日额度，按量付费，没钱手机充值就行
+#   · 支持图片（read_image 真能看见）
+# 想省钱时切回 codebuddy：
+#   python tune_model.py set --preset cb-flash
+"""
 
 
 def _read(path: str = PROFILE) -> str:
@@ -72,15 +116,15 @@ def _read(path: str = PROFILE) -> str:
 
 
 def get_current(path: str = PROFILE) -> dict:
-    """读出当前的 model 和 reasoningEffort。"""
+    """读出当前的 provider / model / reasoningEffort。"""
     try:
         txt = _read(path)
     except OSError as e:
         return {"status": "error", "error": f"读不到配置: {e}"}
 
+    provider = ""
     model = ""
     effort = ""
-    # 只认 agent-default-model 那一段里的，别抓到 models 列表里的 id
     in_block = False
     for line in txt.splitlines():
         s = line.strip()
@@ -90,6 +134,9 @@ def get_current(path: str = PROFILE) -> dict:
         if in_block:
             if s.startswith("- id:") and "agent-default-model" not in s:
                 break
+            m = re.match(r"^provider:\s*(\S+)", s)
+            if m:
+                provider = m.group(1)
             m = re.match(r"^model:\s*(\S+)", s)
             if m:
                 model = m.group(1)
@@ -97,24 +144,45 @@ def get_current(path: str = PROFILE) -> dict:
             if m:
                 effort = m.group(1)
 
+    preset = ""
+    for pid, spec in PRESETS.items():
+        if spec["provider"] == provider and spec["model"] == model:
+            preset = pid
+            break
+
     return {
         "status": "ok",
+        "provider": provider or "(未设置)",
         "model": model or "(未设置)",
         "reasoning_effort": effort or "(未设置)",
+        "preset": preset or "(未知组合)",
         "path": path,
     }
 
 
+def _build_block(spec: dict, effort: str) -> list[str]:
+    lines = [
+        "- id: agent-default-model",
+        '  name: "@deepseek-ai/dsh-agent-default-model"',
+        "  config:",
+        f"    provider: {spec['provider']}",
+        f"    model: {spec['model']}",
+    ]
+    if effort:
+        lines.append(f"    reasoningEffort: {effort}")
+    return lines
+
+
 def apply(
-    model: str = "",
+    preset_id: str = "",
     effort: str = "",
     path: str = PROFILE,
 ) -> dict:
-    """改配置。只改指定的一两项，其余不动。"""
-    if model and model not in MODELS:
+    """按预设重建 agent-default-model 块（可选带推理强度）。"""
+    if preset_id and preset_id not in PRESETS:
         return {
             "status": "error",
-            "error": f"不支持的模型：{model}。可选：{', '.join(MODELS)}",
+            "error": f"不支持的预设：{preset_id}。可选：{', '.join(PRESETS)}",
         }
     if effort and effort.lower() not in EFFORTS:
         return {
@@ -127,54 +195,86 @@ def apply(
     except OSError as e:
         return {"status": "error", "error": f"读不到配置: {e}"}
 
-    # 先备份。这个文件里有人格提示词，改坏了很麻烦。
+    has_bom = txt.startswith("\ufeff")
+    body = txt.lstrip("\ufeff")
+    lines = body.splitlines()
+
+    # 定位 agent-default-model 块
+    start = None
+    end = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("- id: agent-default-model"):
+            start = i
+            for j in range(i + 1, len(lines)):
+                if lines[j].strip().startswith("- id:"):
+                    end = j
+                    break
+            if end is None:
+                end = len(lines)
+            break
+    if start is None:
+        return {"status": "error", "error": "找不到 agent-default-model 块，不敢改"}
+
+    # 决定用哪个 spec 和 effort
+    cur = get_current(path)
+    if preset_id:
+        spec = PRESETS[preset_id]
+        if effort:
+            eff = effort.lower()
+        else:
+            eff = spec.get("effort_default", "")
+        if spec["provider"] != "codebuddy" and eff:
+            return {
+                "status": "error",
+                "error": "官方通道不认 reasoningEffort，别设。只切换预设就行。",
+            }
+    else:
+        # 只调 effort：provider 不变，必须是 codebuddy 才认
+        if cur.get("provider") != "codebuddy":
+            return {
+                "status": "error",
+                "error": (
+                    f"当前走的是 {cur.get('provider')}，不认推理强度。"
+                    "要先切到 cb-flash / cb-pro。"
+                ),
+            }
+        eff = (effort or "high").lower()
+        spec = {
+            "provider": cur.get("provider"),
+            "model": cur.get("model"),
+        }
+
+    # 先备份
     try:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         shutil.copy2(path, f"{path}.bak-{stamp}")
     except OSError as e:
         return {"status": "error", "error": f"备份失败，不敢改: {e}"}
 
-    lines = txt.splitlines()
-    out = []
-    in_block = False
-    changed = {"model": False, "reasoningEffort": False}
-
-    for line in lines:
-        s = line.strip()
-
-        if s.startswith("- id: agent-default-model"):
-            in_block = True
-            out.append(line)
-            continue
-        if in_block and s.startswith("- id:") and "agent-default-model" not in s:
-            in_block = False
-
-        if in_block and model and re.match(r"^\s*model:\s*\S+", line):
-            indent = line[: len(line) - len(line.lstrip())]
-            out.append(f"{indent}model: {model}")
-            changed["model"] = True
-            continue
-        if in_block and effort and re.match(r"^\s*reasoningEffort:\s*\S+", line):
-            indent = line[: len(line) - len(line.lstrip())]
-            out.append(f"{indent}reasoningEffort: {effort.lower()}")
-            changed["reasoningEffort"] = True
-            continue
-
-        out.append(line)
-
-    if not any(changed.values()):
-        return {"status": "unchanged", "note": "没找到要改的行，或者值本来就是这样"}
+    # 重写文件头的注释 + 替换块
+    header = _HEADER_CB if spec["provider"] == "codebuddy" else _HEADER_OFFICIAL
+    first_row = next(
+        (i for i, l in enumerate(lines) if l.strip().startswith("- id:")), 0
+    )
+    new_lines = (
+        header.splitlines()
+        + lines[first_row:start]
+        + _build_block(spec, eff)
+        + lines[end:]
+    )
+    new_txt = "\n".join(new_lines) + "\n"
+    if has_bom:
+        new_txt = "\ufeff" + new_txt
 
     try:
         with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(out) + "\n")
+            f.write(new_txt)
     except OSError as e:
         return {"status": "error", "error": f"写入失败: {e}"}
 
     now = get_current(path)
     return {
         "status": "ok",
-        "changed": [k for k, v in changed.items() if v],
         **now,
     }
 
@@ -183,20 +283,21 @@ def options() -> dict:
     """列出可选值，供调用方展示。"""
     return {
         "current": get_current(),
-        "models": MODELS,
+        "presets": {pid: s["label"] for pid, s in PRESETS.items()},
         "efforts": EFFORTS,
     }
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="调电脑端的模型和推理强度")
+    ap = argparse.ArgumentParser(description="切换任务端的模型/通道")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("show", help="看当前设置")
     sub.add_parser("options", help="列出可选值")
 
     p_set = sub.add_parser("set", help="改设置")
-    p_set.add_argument("--model", default="", help="模型 id")
+    p_set.add_argument("--preset", default="", help="预设名")
+    p_set.add_argument("--model", default="", help="（旧写法）模型名，自动映射成预设")
     p_set.add_argument("--effort", default="", help="推理强度")
 
     args = ap.parse_args()
@@ -208,9 +309,22 @@ def main() -> int:
         print(json.dumps(options(), ensure_ascii=False, indent=2))
         return 0
     if args.cmd == "set":
-        rec = apply(args.model, args.effort)
+        preset = args.preset
+        if not preset and args.model:
+            preset = MODEL_TO_PRESET.get(args.model, "")
+            if not preset:
+                print(json.dumps(
+                    {"status": "error", "error": f"不认识的模型名：{args.model}"},
+                    ensure_ascii=False))
+                return 1
+        if not preset and not args.effort:
+            print(json.dumps(
+                {"status": "error", "error": "至少要给 --preset 或 --effort 其中一个"},
+                ensure_ascii=False))
+            return 1
+        rec = apply(preset, args.effort)
         print(json.dumps(rec, ensure_ascii=False))
-        return 0 if rec.get("status") in ("ok", "unchanged") else 1
+        return 0 if rec.get("status") == "ok" else 1
     return 2
 
 

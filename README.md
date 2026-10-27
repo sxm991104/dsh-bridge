@@ -174,9 +174,13 @@ python bridge.py cancel --id t-20261027120000
 # 看它卡在哪儿（拿不到东西时会写这里）
 python bridge.py ask
 
-# 调模型和推理强度
+# 切模型/通道（模型和通道绑在一起，用"预设"一次切对）
 python tune_model.py show
-python tune_model.py set --model deepseek-flash --effort high
+python tune_model.py options
+python tune_model.py set --preset cb-flash         # codebuddy 4.1-flash（省钱，有每日额度，看不了图）
+python tune_model.py set --preset cb-pro           # codebuddy 4-pro（省钱且更强）
+python tune_model.py set --preset official-flash   # 官方 API（按量付费，无额度，能看图）
+python tune_model.py set --effort high             # 只调推理强度（仅 codebuddy 认，无 medium）
 
 # 给项目加 git 防护（别让 AI 的草稿进仓库）
 python guard_git.py list
