@@ -45,6 +45,7 @@ import ctypes
 import json
 import os
 import subprocess
+import threading
 import sys
 import time
 import traceback
@@ -60,15 +61,22 @@ REQUEST = os.path.join(BRIDGE_DIR, "restart.request")
 RESULT = os.path.join(BRIDGE_DIR, "restart.result")
 STUCK = os.path.join(BRIDGE_DIR, "restart.stuck")
 
-# AstrBot 的启动脚本。开源版必须可配置，不能写死某台机器的路径。
-#
-# 优先级：环境变量 DSH_WATCHDOG_START_BAT > 同目录下的 start_astrbot.bat
+# AstrBot 的启动脚本。可用环境变量覆盖，不写死路径。
 START_BAT = os.environ.get("DSH_WATCHDOG_START_BAT") or os.path.join(
     BRIDGE_DIR, "start_astrbot.bat"
 )
 
 # AstrBot 的 WebUI 端口。起来没起来，就看这个端口通不通。
 PORT = int(os.environ.get("DSH_WATCHDOG_PORT") or "6185")
+
+# 直接起 AstrBot 用的可执行文件——bat 那条路坏了的兜底。
+# 为什么要有这个：全指着 bat 的话，bat 一改坏、一删，
+# 守护就废了，而且是在最需要它的时候。
+ASTRBOT_EXE = os.environ.get("DSH_WATCHDOG_EXE") or os.path.join(
+    os.path.expanduser("~"), ".local", "bin", "astrbot.exe"
+)
+# 起 exe 时的工作目录
+ASTRBOT_CWD = os.environ.get("DSH_WATCHDOG_CWD") or ""
 
 # 冷却期：两次重启之间至少隔这么久（秒）
 COOLDOWN = 300
@@ -78,6 +86,13 @@ READY_TIMEOUT = 120
 MAX_CONSECUTIVE_FAIL = 3
 # 请求文件多久没处理就算过期（避免积压的旧请求突然触发）
 REQUEST_STALE = 600
+
+# 主动体检：每隔多久查一次"服务还活着吗"（秒）
+# 这条和"有人请求重启"是两条独立的线——
+# 没有人请求、AstrBot 自己崩了，也要能发现。
+PROBE_SECONDS = int(os.environ.get("DSH_WATCHDOG_PROBE") or "30")
+# 连续几次查不到才判定挂了（防止偶发抖动、也防止正在启动时误判）
+PROBE_MISS_LIMIT = 3
 
 
 def _log(msg: str) -> None:
@@ -135,18 +150,47 @@ def _kill_astrbot_tree() -> bool:
 
 
 def _start_astrbot() -> bool:
-    """拉起 AstrBot。用 start 开独立窗口，不挂在守护进程下面。"""
-    try:
-        subprocess.Popen(
-            ["cmd", "/c", "start", "", START_BAT],
-            cwd=os.path.dirname(START_BAT),
-            shell=False,
-            close_fds=True,
-        )
-        return True
-    except Exception as e:  # noqa: BLE001
-        _log(f"拉起失败: {e}")
-        return False
+    """拉起 AstrBot。两条路：先走 bat，不行就直接起 exe。
+
+    ⚠️ 为什么要双保险（这条是别人提醒的，提醒得对）：
+        原来只指着 start_astrbot.bat。**那个 bat 一旦被改坏、被删、
+        或者里面路径变了，整个守护就废了**——而且是在最需要它的时候。
+        所以留一条不依赖 bat 的路：直接调 astrbot.exe。
+
+    两个都尽量用"独立窗口"的方式起，不要挂在守护进程下面：
+    守护进程自己重启时不能把 AstrBot 一起带走。
+    """
+    # 路线一：bat（正常情况走这条，因为它可能有环境变量设置）
+    if os.path.exists(START_BAT):
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", START_BAT],
+                cwd=os.path.dirname(START_BAT),
+                shell=False,
+                close_fds=True,
+            )
+            _log(f"用 bat 拉起: {START_BAT}")
+            return True
+        except Exception as e:  # noqa: BLE001
+            _log(f"bat 拉起失败（{e}），改用 exe 直接起")
+
+    # 路线二：直接起 astrbot.exe —— 不依赖那个 bat
+    exe = ASTRBOT_EXE
+    if exe and os.path.exists(exe):
+        try:
+            subprocess.Popen(
+                [exe, "run"],
+                cwd=ASTRBOT_CWD or None,
+                shell=False,
+                close_fds=True,
+            )
+            _log(f"用 exe 拉起: {exe} run")
+            return True
+        except Exception as e:  # noqa: BLE001
+            _log(f"exe 拉起也失败: {e}")
+
+    _log("两条路都不通：bat 不可用，exe 也起不来")
+    return False
 
 
 def _wait_ready() -> bool:
@@ -282,6 +326,89 @@ _FILE_NOTIFY_CHANGE_LAST_WRITE = 0x00000010
 _FILE_NOTIFY_CHANGE_SIZE = 0x00000008
 
 
+# ----------------------------------------------------------------------
+# 主动体检：没人请求，也要知道服务死没死
+# ----------------------------------------------------------------------
+
+_miss_count = 0
+
+
+def probe_loop() -> None:
+    """每隔 PROBE_SECONDS 查一次端口，连续 MISS 次不通就拉起来。
+
+    ⚠️ 这条是别人指出来的，指得对：
+        第一版只做了"有人写 restart.request 才重启"。
+        但 AstrBot 自己崩了的时候，**没有人会写那个文件**——
+        守护进程就那么干看着，等于没装。
+
+        真正的守护得主动体检。
+
+    为什么是轮询而不是事件：
+        服务死掉这件事不会通知任何人，没有可监听的事件源。
+        只能去问。30 秒问一次，开销可以忽略（一次 TCP 连接尝试）。
+
+    为什么要连续 MISS 次才动手：
+        偶尔一次连不上（正在启动、系统卡顿）不算死。
+        连续三次都连不上（约 90 秒）才算。
+    """
+    global _miss_count
+    while True:
+        time.sleep(PROBE_SECONDS)
+
+        if _port_open():
+            if _miss_count:
+                _log(f"服务恢复（之前漏了 {_miss_count} 次探测）")
+            _miss_count = 0
+            continue
+
+        _miss_count += 1
+        _log(f"体检：{PORT} 端口不通（第 {_miss_count}/{PROBE_MISS_LIMIT} 次）")
+
+        if _miss_count < PROBE_MISS_LIMIT:
+            continue
+
+        # 连续多次不通 —— 判定挂了，走同一套重启流程
+        _log("连续探测不到，判定服务已挂，开始拉起")
+        try:
+            _auto_restart()
+        except Exception:  # noqa: BLE001
+            _log("自动拉起时异常:\n" + traceback.format_exc())
+        _miss_count = 0
+
+
+def _auto_restart() -> None:
+    """自动拉起。走和手动请求一样的防护逻辑，但不读请求文件。"""
+    global _last_restart, _consecutive_fail
+
+    if _consecutive_fail >= MAX_CONSECUTIVE_FAIL:
+        _log(f"连续失败 {_consecutive_fail} 次，停止自动拉起（删 {STUCK} 才恢复）")
+        try:
+            with open(STUCK, "w", encoding="utf-8") as f:
+                f.write(datetime.now().isoformat())
+        except OSError:
+            pass
+        return
+
+    since = time.time() - _last_restart
+    if _last_restart and since < COOLDOWN:
+        _log(f"冷却中（还要等 {int(COOLDOWN - since)} 秒），这次不拉")
+        return
+
+    started = time.time()
+    if not _start_astrbot():
+        _consecutive_fail += 1
+        _log("自动拉起：启动命令失败")
+        return
+
+    if _wait_ready():
+        _last_restart = time.time()
+        _consecutive_fail = 0
+        _log(f"自动拉起成功，用时 {round(time.time() - started, 1)} 秒")
+    else:
+        _consecutive_fail += 1
+        _log(f"自动拉起失败：{READY_TIMEOUT} 秒内 {PORT} 没起来（第 {_consecutive_fail} 次）")
+
+
 def watch_loop() -> None:
     """监听目录变化。
 
@@ -348,16 +475,6 @@ def watch_loop() -> None:
 def main() -> None:
     _log("守护启动")
 
-    # 启动自检：启动脚本不存在就别装模作样地跑下去。
-    # 否则它会在"看起来在守护"的状态里，真要重启时才发现叫不起来。
-    if not os.path.exists(START_BAT):
-        _log(f"⚠️ 启动脚本不存在: {START_BAT}")
-        _log("   用环境变量 DSH_WATCHDOG_START_BAT 指定，或把 start_astrbot.bat 放同目录")
-        _log("   守护仍然监听，但拉起会失败——先修好路径")
-    else:
-        _log(f"启动脚本: {START_BAT}")
-    _log(f"监控端口: {PORT}")
-
     # 启动时如果服务就是死的，顺手拉一把 —— 这不消耗任何东西，只是开机自检
     if not _port_open():
         _log("启动时发现 AstrBot 没在跑，先拉起")
@@ -365,6 +482,11 @@ def main() -> None:
             _log("自检拉起成功")
         else:
             _log("自检拉起失败，继续监听请求")
+
+    # 两条线并行：一条听"有人要重启"，一条定期体检"服务还活着吗"
+    t = threading.Thread(target=probe_loop, daemon=True, name="probe")
+    t.start()
+    _log(f"主动体检已启动，每 {PROBE_SECONDS} 秒一次")
 
     watch_loop()
 
