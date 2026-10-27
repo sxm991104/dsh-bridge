@@ -105,6 +105,7 @@
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh` 命令能跑）
 - 一个能跑 `dsh headless` 的 profile（下面讲怎么配）
 - Python 3.10+
+- `pywin32`（只有 `watchdog.py` 需要——它用 Windows 的目录变更通知）
 
 **你还需要知道：**
 - 它默认给电脑端**全权限**（`danger-full-access`），跟桌面版同一个权限级别
@@ -279,6 +280,80 @@ python guard_git.py apply D:\Project\某个项目
 **`C:\Users\<你>\Downloads` 下面是能接管的**（那里本来就有沙箱标记：deny FILE_DELETE_CHILD、专用 SID、Low 完整性标签）。
 
 **如果 `danger-full-access` 也起不来，先把工作目录换到 Downloads 下面试试。**
+
+---
+
+## 服务挂了怎么办（watchdog.py）
+
+**这是这个项目里最容易被忽略、但最要命的一块。**
+
+### 问题
+
+桥跑在 AstrBot 进程里。**AstrBot 一挂，桥跟着挂，然后没人能把它拉起来。**
+
+如果重启这件事交给桥自己干：
+
+```
+桥让 AstrBot 重启
+  → AstrBot 死
+  → 桥跟着死（它在同一棵进程树里）
+  → 没人再把它拉起来
+```
+
+死锁。**而这个死锁恰好在最要紧的时候发生：你人在外面，改完东西需要重启验证，结果一重启整个系统就没了。**
+
+### 做法
+
+一个**不在 AstrBot 进程树下面**的独立进程，专门盯着一件事：
+
+```
+<桥目录>\restart.request      ← 谁要重启，往这里写一行
+<桥目录>\restart.result       ← 守护把结果写回来
+```
+
+守护进程做的事：看到请求 → 杀掉 AstrBot 整棵树 → 拉起 → 等端口 → 写结果。
+
+### 为什么不用计划任务轮询
+
+计划任务是"每 N 分钟查一次"，**没病也去敲门**。而且真挂的时候要等下一个周期才发现。
+
+这里用 Windows 的目录变更通知（`ReadDirectoryChangesW`）：**内核在文件变化时把事件推过来，没有事件时这个进程一个 CPU 周期都不占。**
+
+### 三层防护（这些不是可选项）
+
+| 防护 | 为什么必须有 |
+|---|---|
+| **冷却 5 分钟** | 我自己因为反复重启 AstrBot 被 QQ 踢下线过一次。重启太频繁会触发风控，这条就是挡这个的 |
+| **连续失败 3 次就停手** | 免得变成"起了就崩、崩了再起"的死循环，把机器拖死。停手后写 `.stuck` 文件，等人来看 |
+| **不碰 NapCat** | NapCat 自己会重连。重启它反而容易触发风控，得不偿失 |
+
+### 用起来
+
+```bash
+# 装依赖（pywin32 用于目录监控）
+pip install pywin32
+
+# 指定 AstrBot 的启动脚本（或者把 start_astrbot.bat 放到同目录）
+set DSH_WATCHDOG_START_BAT=D:\你的AstrBot目录\.bot_runtime\start_astrbot.bat
+set DSH_WATCHDOG_PORT=6185
+
+# 启动（pythonw 无窗口）
+pythonw watchdog.py
+```
+
+**让它开机自启**（Windows）：
+
+```powershell
+schtasks /create /tn "dsh-watchdog" /tr "pythonw.exe C:\path\to\watchdog.py" /sc onlogon /rl highest
+```
+
+### 一次改写的记录
+
+第一版监听是用 `ctypes` 直接调 `ReadDirectoryChangesW` 写的。
+
+**实测：往目录里写文件，守护进程 CPU 一直是 0，没有任何反应。** 调用卡在里面不返回，参数拼错也不报错。
+
+ctypes 拼 Win32 结构太容易出无声的错，**换成 `pywin32` 的 `win32file` 才正常。**
 
 ---
 
