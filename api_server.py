@@ -224,6 +224,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/tasks":
             return self._tasks()
 
+        if path.startswith("/api/windows"):
+            return self._windows(path)
+
         if path == "/api/live":
             try:
                 st, b = _json(bridge.cmd_live())
@@ -245,6 +248,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/engine":
             return self._engine_get()
+
+        if path == "/api/engine/profiles":
+            return self._profiles_get()
+
 
         if path == "/api/autostart":
             try:
@@ -278,15 +285,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/dispatch":
             task = (body.get("task") or "").strip()
             name = (body.get("name") or "").strip()
+            profile = (body.get("profile") or "").strip()
             if not task:
                 return self._send(400, b'{"error":"task is required"}')
             if not name:
                 return self._send(400, b'{"error":"name is required"}')
             try:
-                rec = bridge.cmd_dispatch(task, name)
-                # 起后台进程真干活
-                self._spawn(name)
-                st, b = _json(rec)
+                st, b = _json(self._dispatch_with_concurrency(task, name, profile))
             except Exception as e:  # noqa: BLE001
                 st, b = _json({"error": f"{type(e).__name__}: {e}"}, 500)
             return self._send(st, b)
@@ -307,6 +312,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/engine":
             try:
                 st, b = _json(self._engine_set(body))
+            except Exception as e:  # noqa: BLE001
+                st, b = _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+            return self._send(st, b)
+
+        if path == "/api/engine/profiles":
+            try:
+                st, b = _json(self._profiles_act(body))
+            except Exception as e:  # noqa: BLE001
+                st, b = _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+            return self._send(st, b)
+
+        if path == "/api/engine/models":
+            try:
+                st, b = _json(self._engine_models(body))
             except Exception as e:  # noqa: BLE001
                 st, b = _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
             return self._send(st, b)
@@ -388,6 +407,41 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── 具体处理 ──
 
+    def _windows(self, path: str):
+        """列出某套配置下面的所有窗口。
+
+        前台（QQ/飞书那边的丫头）拿这个判断"这个活该不该放进已有窗口"。
+        判断逻辑在前台，这里只负责把事实给她：
+            · 窗口叫什么
+            · 它开头那段需求是什么（方便她对照上下文）
+            · 现在什么状态
+
+        ?profile=xxx 只看那套；不给就看全部。
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        q = parse_qs(urlparse(path).query)
+        want = (q.get("profile") or [""])[0]
+
+        tasks = bridge._read_tasks()
+        out = []
+        for t in tasks:
+            pid = t.get("profile") or ""
+            if want and pid != want:
+                continue
+            out.append({
+                "name": t.get("id") or "",
+                "profile": pid,
+                "status": t.get("status") or "",
+                "task": (t.get("task") or "")[:300],
+                "created_at": t.get("created_at") or "",
+                "finished_at": t.get("finished_at") or "",
+            })
+
+        # 最近动过的排前面
+        out.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+        return self._send(*_json({"ok": True, "windows": out}))
+
     def _tasks(self):
         """任务列表：把 state 和 tasks.jsonl 合起来给前端。
 
@@ -444,6 +498,120 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             self._send(*_json({"error": f"{type(e).__name__}: {e}"}, 500))
 
+    def _dispatch_with_concurrency(self, task: str, name: str,
+                                   profile: str) -> dict:
+        """派活，并按这套配置的并发额度决定立刻跑还是排队。
+
+        为什么要排队而不是拒绝：
+            用户派完就关窗口了，不会回来看"哎呀满了要重试"。
+            排着队，等有空位后台自己会拉起来。
+
+        状态用 queued，跟 pending 的区别：
+            pending  刚派，还没轮到（通常马上就跑）
+            queued   这套满了，明确在等
+        """
+        import engine.profiles as P
+        import engine.scheduler as S
+
+        # ⚠️ 顺序很重要：先看有没有空位，再派活。
+        #
+        #    原来反了：先 cmd_dispatch 写进去（状态 pending），
+        #    再检查 has_slot。而 pending 是算占位的，
+        #    等于"我自己刚占了一个位子，然后检查还有没有空位"——
+        #    conc=1 的配置永远显示"满了"，第一个任务就排队，再也不会跑。
+        #
+        #    所以先定好用哪套、看它现在几个占位、还有没有位置，
+        #    最后才真正写进去。
+        pid = (profile or "").strip()
+        if not pid:
+            pid = (P.default_profile() or {}).get("id") or ""
+
+        prof = P.get_profile(pid) if pid else {}
+        limit = int((prof or {}).get("concurrency") or 1)
+
+        has_room = S.has_slot(pid, limit) if pid else True
+
+        rec = bridge.cmd_dispatch(task, name, pid)
+
+        if has_room:
+            self._spawn(name)
+            return rec
+
+        # 满了：标成排队
+        bridge._update_task(name, status="queued")
+        bridge.write_state(name, status="queued", profile=pid)
+        rec["status"] = "queued"
+        rec["queue_position"] = S.queue_position(pid, name)
+        rec["queue_total"] = limit
+        return rec
+
+    def _profiles_get(self):
+        """把全部模型配置交给界面。
+
+        key 不回传原文，只给尾号——界面上不需要看到完整 key。
+        """
+        from engine.profiles import load_all
+
+        data = load_all()
+        out = []
+        for prof in data.get("profiles") or []:
+            key = prof.get("api_key") or ""
+            out.append({
+                "id": prof.get("id"),
+                "name": prof.get("name"),
+                "base_url": prof.get("base_url"),
+                "model": prof.get("model"),
+                "has_key": bool(key),
+                "key_tail": key[-4:] if len(key) >= 4 else "",
+                "max_steps": prof.get("max_steps") or 40,
+                "enabled": prof.get("enabled", True),
+                "concurrency": prof.get("concurrency", 1),
+            })
+        return self._send(*_json({
+            "ok": True,
+            "active": data.get("active") or "",
+            "profiles": out,
+        }))
+
+    def _profiles_act(self, body: dict) -> dict:
+        """加、改、删、切换模型配置。
+
+        action 可以是：
+            add     新增一套（需要 name / base_url / api_key / model）
+            update  改一套（需要 id，其余字段可选）
+            delete  删一套（需要 id）
+            switch  切换到某套（需要 id）
+        """
+        from engine.profiles import (
+            add_profile, delete_profile, set_active, update_profile,
+        )
+
+        action = (body.get("action") or "").strip()
+
+        if action == "add":
+            prof = add_profile(body)
+            return {"ok": True, "id": prof["id"]}
+
+        if action == "update":
+            pid = (body.get("id") or "").strip()
+            if not pid:
+                return {"ok": False, "error": "没说要改哪一套"}
+            return {"ok": update_profile(pid, body)}
+
+        if action == "delete":
+            pid = (body.get("id") or "").strip()
+            if not pid:
+                return {"ok": False, "error": "没说要删哪一套"}
+            return {"ok": delete_profile(pid)}
+
+        if action == "switch":
+            pid = (body.get("id") or "").strip()
+            if not pid:
+                return {"ok": False, "error": "没说要切到哪一套"}
+            return {"ok": set_active(pid)}
+
+        return {"ok": False, "error": f"不认识的动作：{action}"}
+
     def _engine_get(self):
         """任务端现在用哪个模型。
 
@@ -467,6 +635,37 @@ class Handler(BaseHTTPRequestHandler):
             }))
         except Exception as e:  # noqa: BLE001
             return self._send(*_json({"ok": False, "error": str(e)}, 500))
+
+    def _engine_models(self, body: dict):
+        """列出这个接口上可用的模型，给界面做下拉框。
+
+        用 POST + JSON 传参，不用 query string。
+        踩过：把 base_url 塞在 URL 里，里面的 "//" 在解析时丢了，
+        结果一直读到已保存的旧地址，查出来的是另一家的模型列表。
+        JSON 里传字符串没有这种坑。
+
+        key 留空就用配置里存的——用户只改地址时不用重输。
+        """
+        from engine.models import list_models, pick_default
+
+        base = (body.get("base_url") or "").strip()
+        key = (body.get("api_key") or "").strip()
+
+        import engine_bridge
+
+        cur = engine_bridge.load_config()
+        base = base or cur.get("base_url") or ""
+        key = key or cur.get("api_key") or ""
+
+        ok, models, err = list_models(base, key)
+        if not ok:
+            return self._send(*_json({"ok": False, "error": err}))
+
+        return self._send(*_json({
+            "ok": True,
+            "models": models,
+            "default": pick_default(models),
+        }))
 
     def _engine_set(self, body: dict) -> dict:
         """保存模型配置。
@@ -881,6 +1080,19 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--host", default="127.0.0.1")
     args = ap.parse_args()
+
+    # 起一个后台线程，定期把排队中的任务拉起来。
+    #
+    # 为什么放在接口服务里而不是桥里：
+    #   桥是一次性的（跑完就退出），接口服务是常驻的。
+    #   排队轮转需要一个一直在的东西来做。
+    try:
+        import engine.scheduler as S
+
+        S.start_pump_in_background(interval=5.0)
+        print("[api] 排队轮转已启动（每 5 秒检查空位）")
+    except Exception as e:  # noqa: BLE001
+        print(f"[api] 排队轮转没起来：{e}")
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[api] 桥接口已启动：http://{args.host}:{args.port}")

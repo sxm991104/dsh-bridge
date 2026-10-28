@@ -101,6 +101,15 @@ def run(task: str, workdir: str, llm: LLM, max_steps: int = 40,
                 "content": f"（模型调用失败：{e}）",
             })
             prog.doing = f"失败：{e}"
+            # ⚠️ 这个赋值必须在 return 之前。
+            #
+            #    原来漏了它，导致这条错误路径返回的 prog.messages 是空的。
+            #    上层 final_text() 取不到那条错误消息，只好退回 prog.doing，
+            #    而 prog.doing 是"失败：接口返回 401…"，不以"（模型调用失败"开头，
+            #    于是被判成"成功"——状态显示 ok，结果栏里却是一段错误。
+            #
+            #    这就是"假成功"：用户看到 ok，以为活干完了。
+            prog.messages = messages
             _save(workdir, messages, prog)
             return prog
 

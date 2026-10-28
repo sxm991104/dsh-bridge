@@ -39,63 +39,99 @@ APP_NAME = "dsh-bridge"
 # ----------------------------------------------------------------------
 
 def config_path() -> str:
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, APP_NAME)
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, "engine.json")
+    from engine.profiles import config_path as _cp
+
+    return _cp()
 
 
-DEFAULTS = {
-    # 留空表示还没配，界面上要提示用户去填
-    "base_url": "",
-    "api_key": "",
-    "model": "",
-    "max_steps": 40,
-}
+def _load_profile_config(pid: str) -> dict:
+    """按 id 取一套配置。空 id 或找不到就用默认那套。"""
+    from engine.profiles import default_profile, get_profile
+
+    prof = get_profile(pid) if pid else {}
+    if not prof:
+        prof = default_profile()
+    if not prof:
+        return {"base_url": "", "api_key": "", "model": "",
+                "max_steps": 40, "_empty": True}
+    return {
+        "base_url": prof.get("base_url") or "",
+        "api_key": prof.get("api_key") or "",
+        "model": prof.get("model") or "",
+        "max_steps": int(prof.get("max_steps") or 40),
+        "_id": prof.get("id") or "",
+        "_name": prof.get("name") or "",
+    }
 
 
 def load_config() -> dict:
-    data = dict(DEFAULTS)
-    p = config_path()
-    if os.path.exists(p):
-        try:
-            with open(p, encoding="utf-8") as f:
-                disk = json.load(f)
-            if isinstance(disk, dict):
-                for k in DEFAULTS:
-                    if k in disk:
-                        data[k] = disk[k]
-        except (OSError, json.JSONDecodeError):
-            pass
-    return data
+    """当前正在用的那套配置。
+
+    返回的还是老形状（base_url / api_key / model / max_steps），
+    这样调用方不用改。多套的管理在 engine.profiles 里。
+    """
+    from engine.profiles import active_profile
+
+    prof = active_profile()
+    if not prof:
+        return {"base_url": "", "api_key": "", "model": "",
+                "max_steps": 40, "_empty": True}
+    return {
+        "base_url": prof.get("base_url") or "",
+        "api_key": prof.get("api_key") or "",
+        "model": prof.get("model") or "",
+        "max_steps": int(prof.get("max_steps") or 40),
+        "_id": prof.get("id") or "",
+        "_name": prof.get("name") or "",
+    }
 
 
 def save_config(cfg: dict) -> None:
-    p = config_path()
-    tmp = p + ".tmp"
-    clean = {k: cfg.get(k, DEFAULTS[k]) for k in DEFAULTS}
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(clean, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, p)
+    """改当前那套。
+
+    兼容老调用（传一个完整 dict 进来）：如果当前没有配置，
+    就新建一套；有的话就更新它。
+    """
+    from engine.profiles import (
+        active_profile, add_profile, update_profile, set_active,
+    )
+
+    prof = active_profile()
+    if not prof:
+        add_profile({
+            "name": cfg.get("_name") or "默认",
+            "base_url": cfg.get("base_url") or "",
+            "api_key": cfg.get("api_key") or "",
+            "model": cfg.get("model") or "",
+            "max_steps": cfg.get("max_steps") or 40,
+        })
+        return
+
+    update_profile(prof["id"], {
+        "base_url": cfg.get("base_url") or "",
+        "model": cfg.get("model") or "",
+        "api_key": cfg.get("api_key") or "",
+        "max_steps": cfg.get("max_steps") or 40,
+    })
 
 
 def is_configured() -> bool:
-    c = load_config()
-    return bool(c.get("base_url") and c.get("api_key") and c.get("model"))
+    from engine.profiles import is_configured as _ic
+
+    return _ic()
 
 
-# ----------------------------------------------------------------------
-# 派活
-# ----------------------------------------------------------------------
-
-def dispatch(task: str, task_id: str, workdir: str) -> dict:
+def dispatch(task: str, task_id: str, workdir: str,
+             profile_id: str = "") -> dict:
     """跑一个任务，返回跟原来 _invoke_dsh 一模一样的形状。
 
-    workdir 是这个任务自己的工作目录。相对路径都以它为准。
+    workdir   这个任务自己的工作目录。相对路径都以它为准。
+    profile_id 用哪套配置（空表示默认那套）。
+               多套配置同时启用时，每个任务跑在自己的模型上。
     """
     t0 = time.time()
 
-    cfg = load_config()
+    cfg = _load_profile_config(profile_id)
     if not is_configured():
         return {
             "status": "error",
@@ -171,7 +207,20 @@ def dispatch(task: str, task_id: str, workdir: str) -> dict:
         }
 
     text = final_text(prog)
-    failed = text.startswith("（模型调用失败")
+    # 判断失败不能只看一个前缀——万一那段话被别的东西包了一层就漏了。
+    # 这里三条都算：
+    #   1. final_text 拿到的是"模型调用失败"
+    #   2. prog.doing 里写着"失败"
+    #   3. 没有 assistant 说过任何话（等于整轮没产出）
+    failed = (
+        text.startswith("（模型调用失败")
+        or "模型调用失败" in text
+        or (prog.doing or "").startswith("失败")
+        or not any(
+            m.get("role") == "assistant" and (m.get("content") or "").strip()
+            for m in (prog.messages or [])
+        )
+    )
 
     return {
         "status": "error" if failed else "ok",

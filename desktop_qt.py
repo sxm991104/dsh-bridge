@@ -166,9 +166,9 @@ class Api(QObject):
         self._pending_cb = None
         self._once.connect(self._dispatch_once)
 
-    def _dispatch_once(self, data) -> None:
-        cb = self._pending_cb
-        self._pending_cb = None
+    def _dispatch_once(self, payload) -> None:
+        """收到请求结果，调它自己的回调。"""
+        data, cb = payload if isinstance(payload, tuple) else (payload, None)
         if cb:
             try:
                 cb(data)
@@ -211,9 +211,16 @@ class Api(QObject):
             except Exception as e:  # noqa: BLE001
                 data = {"ok": False, "error": f"{type(e).__name__}: {e}"}
             if callback:
-                # 信号发射是线程安全的，Qt 会把槽排到主线程执行
-                self._pending_cb = callback
-                self._once.emit(data)
+                # ⚠️ 回调必须跟着数据一起传，不能存到一个共享变量里。
+                #
+                #    原来写的是 self._pending_cb = callback，然后 emit。
+                #    两个请求同时发出时，后一个会把前一个的回调覆盖掉，
+                #    于是前一个的数据回来时调的是别人的回调——
+                #    表现是"这次打开设置页什么都没有，下次又有了"。
+                #    这种间歇性的 bug 最难查，因为它是竞态。
+                #
+                #    改成把回调放进信号参数里发出去，每个请求各回各的。
+                self._once.emit((data, callback))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -532,7 +539,8 @@ class PathRow(QWidget):
 
         # 高度必须钉死：放进 QVBoxLayout 又没有弹簧时，
         # Qt 会把控件压到最小高度，标签挤成一条线。
-        self.setFixedHeight(56)
+        # 高度要跟着输入框一起变：16(标签) + 38(输入框) + 3(间距) + 余量
+        self.setFixedHeight(62)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         lay = QVBoxLayout(self)
@@ -548,7 +556,7 @@ class PathRow(QWidget):
         row = QHBoxLayout()
         row.setSpacing(8)
         self.edit = QLineEdit()
-        self.edit.setFixedHeight(32)
+        self.edit.setMinimumHeight(36)
         self.edit.setPlaceholderText(hint or "自动探测不到，点右边选择")
         # textChanged 带一个字符串参数，changed 是无参信号，
         # 直接连会报错，用 lambda 吞掉。
@@ -557,7 +565,7 @@ class PathRow(QWidget):
 
         btn = QPushButton("选择…")
         btn.setObjectName("ghost")
-        btn.setFixedHeight(32)
+        btn.setMinimumHeight(36)
         btn.setMinimumWidth(70)
         btn.setCursor(Qt.PointingHandCursor)
         btn.clicked.connect(self._browse)
@@ -832,6 +840,11 @@ class MainWindow(QMainWindow):
         self.filter = "all"
         self._qr_dlg = None
         self._list_limit = 50      # 一次渲染多少行，不够可以再加
+        # 模型配置列表
+        self._profiles = []
+        self._active_pid = ""
+        self._selected_pid = ""
+        self._profile_error = ""
         self.api = Api()
         self.api.done.connect(self._on_api)
 
@@ -953,9 +966,18 @@ class MainWindow(QMainWindow):
                 background:{C_RAISED}; border-color:{C_LINE_HI}; color:{C_TEXT};
             }}
 
+            /* ⚠️ 输入框这里踩了一个坑：
+               给 QLineEdit 设 setFixedHeight 之后，Qt 会把文字
+               按默认的内边距画，结果上半截跑到框外面，
+               看起来像"文字被遮挡"——截了三次图才发现不是截断，是位置错了。
+
+               正确做法：**不要 setFixedHeight**，让 Qt 按字体和 padding
+               自己算高度；只给一个最小高度兜底。
+               这样文字永远在框里，居中。 */
             QLineEdit, QPlainTextEdit, QTextEdit, QComboBox {{
                 background:{C_INPUT}; border:1px solid {C_LINE};
-                color:{C_TEXT}; border-radius:9px; padding:9px 13px;
+                color:{C_TEXT}; border-radius:9px;
+                padding:7px 13px;
                 font-size:13px; selection-background-color:{C_ACCENT};
             }}
             QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QComboBox:focus {{
@@ -1070,7 +1092,7 @@ class MainWindow(QMainWindow):
         for i, b in enumerate(self.nav_btns):
             b.setChecked(i == idx)
         if idx == 2:
-            self._load_engine()
+            self._load_profiles()
             self._load_paths()
             self._refresh_autostart()
 
@@ -1235,42 +1257,95 @@ class MainWindow(QMainWindow):
 
         # ── 任务端模型 ──
         #
-        # 这一块是"用户自带 Key"的入口。填完之后任务端就不需要
-        # DeepSeek Harness 了——任何 OpenAI 兼容的接口都能接。
+        # 做成"列表 + 详情"：
+        #   上面是你的几套配置（每套一个服务商）
+        #   点一行选中，下面填这一套的地址、Key、模型
+        #   可以新增、删除、切换
         card = QFrame()
         card.setObjectName("card")
         cl = QVBoxLayout(card)
         cl.setContentsMargins(20, 18, 20, 18)
         cl.setSpacing(9)
 
-        m = QLabel("任务端用哪个模型")
-        m.setFont(font(13, QFont.DemiBold))
-        m.setStyleSheet(f"color:{C_TEXT};")
-        cl.addWidget(m)
+        mh = QLabel("任务端用哪个模型")
+        mh.setFont(font(13, QFont.DemiBold))
+        mh.setStyleSheet(f"color:{C_TEXT};")
+        cl.addWidget(mh)
 
-        msub = QLabel("填你自己的接口就行。OpenAI、DeepSeek、通义、Kimi、本地 Ollama 都支持。")
+        msub = QLabel("可以存好几套，随时切换。当前用的那套会标绿点。")
         msub.setFont(font(11))
         msub.setStyleSheet(f"color:{C_DIM2};")
         cl.addWidget(msub)
 
-        def field(label: str, placeholder: str, secret: bool = False):
+        # 配置列表。
+        #
+        # ⚠️ 必须包在一个 QWidget 里，不能直接 addLayout。
+        #    直接塞 layout 的话，清空时 takeAt + deleteLater
+        #    会作用到父容器身上，把别人的控件也删掉——
+        #    实测报 "Internal C++ object already deleted"，
+        #    整个设置页的输入框全废了。
+        self.profile_host = QWidget()
+        self.profile_box = QVBoxLayout(self.profile_host)
+        self.profile_box.setContentsMargins(0, 0, 0, 0)
+        self.profile_box.setSpacing(4)
+        cl.addWidget(self.profile_host)
+
+        # 新增按钮
+        addrow = QHBoxLayout()
+        addrow.setSpacing(8)
+        self.btn_add_profile = QPushButton("＋ 新增一套")
+        self.btn_add_profile.setObjectName("ghost")
+        self.btn_add_profile.setCursor(Qt.PointingHandCursor)
+        self.btn_add_profile.clicked.connect(self._add_profile)
+        addrow.addWidget(self.btn_add_profile)
+        addrow.addStretch()
+        cl.addLayout(addrow)
+
+        # 分隔线
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet(f"background:{C_LINE};")
+        cl.addWidget(line)
+
+        # 编辑区
+        self.edit_title = QLabel("选一套来改")
+        self.edit_title.setFont(font(11))
+        self.edit_title.setStyleSheet(f"color:{C_DIM2};")
+        cl.addWidget(self.edit_title)
+
+        def field2(label: str, placeholder: str, secret: bool = False):
             lb = QLabel(label)
             lb.setFont(font(11))
             lb.setStyleSheet(f"color:{C_DIM2};")
             cl.addWidget(lb)
             ed = QLineEdit()
-            ed.setFixedHeight(32)
+            ed.setMinimumHeight(36)
             ed.setPlaceholderText(placeholder)
             if secret:
                 ed.setEchoMode(QLineEdit.Password)
             cl.addWidget(ed)
             return ed
 
-        self.ed_base = field("接口地址", "https://api.deepseek.com")
-        self.ed_key = field("API Key", "留空表示不改", secret=True)
-        self.ed_model = field("模型名", "deepseek-chat")
+        self.ed_base = field2("接口地址", "https://api.openai.com")
+        self.ed_key = field2("API Key", "留空表示不改", secret=True)
 
-        # 常用服务的快捷填充
+        self.lbl_key_state = QLabel("")
+        self.lbl_key_state.setFont(font(10.5))
+        self.lbl_key_state.setStyleSheet(f"color:{C_DIM2};")
+        cl.addWidget(self.lbl_key_state)
+
+        lbl_model = QLabel("模型名")
+        lbl_model.setFont(font(11))
+        lbl_model.setStyleSheet(f"color:{C_DIM2};")
+        cl.addWidget(lbl_model)
+
+        self.cmb_engine_model = QComboBox()
+        self.cmb_engine_model.setEditable(True)
+        self.cmb_engine_model.setMinimumHeight(36)
+        self.cmb_engine_model.lineEdit().setPlaceholderText("选一个，或者直接输入")
+        cl.addWidget(self.cmb_engine_model)
+
+        # 快速填
         quick = QHBoxLayout()
         quick.setSpacing(8)
         ql = QLabel("快速填：")
@@ -1280,21 +1355,23 @@ class MainWindow(QMainWindow):
         for name, base, model in (
             ("DeepSeek", "https://api.deepseek.com", "deepseek-chat"),
             ("OpenAI", "https://api.openai.com", "gpt-4o"),
-            ("Kimi", "https://api.moonshot.cn", "moonshot-v1-8k"),
+            ("Kimi", "https://api.moonshot.cn", "kimi-k2.6"),
             ("通义", "https://dashscope.aliyuncs.com/compatible-mode", "qwen-plus"),
+            ("硅基流动", "https://api.siliconflow.cn/v1", "deepseek-ai/DeepSeek-V3"),
         ):
             b = QPushButton(name)
             b.setObjectName("ghost")
             b.setCursor(Qt.PointingHandCursor)
             b.clicked.connect(
                 lambda _=False, u=base, mo=model: (
-                    self.ed_base.setText(u), self.ed_model.setText(mo)
+                    self.ed_base.setText(u), self._set_model_text(mo)
                 )
             )
             quick.addWidget(b)
         quick.addStretch()
         cl.addLayout(quick)
 
+        # 操作按钮
         arow2 = QHBoxLayout()
         arow2.setSpacing(8)
 
@@ -1310,6 +1387,12 @@ class MainWindow(QMainWindow):
         b_save.clicked.connect(self._save_engine)
         arow2.addWidget(b_save)
 
+        self.btn_del_profile = QPushButton("删除这套")
+        self.btn_del_profile.setObjectName("ghost")
+        self.btn_del_profile.setCursor(Qt.PointingHandCursor)
+        self.btn_del_profile.clicked.connect(self._delete_profile)
+        arow2.addWidget(self.btn_del_profile)
+
         self.lbl_engine = QLabel("")
         self.lbl_engine.setFont(font(10.5))
         self.lbl_engine.setStyleSheet(f"color:{C_DIM2};")
@@ -1322,6 +1405,15 @@ class MainWindow(QMainWindow):
         self.lbl_engine_now.setStyleSheet(f"color:{C_DIM2};")
         cl.addWidget(self.lbl_engine_now)
 
+        # ⚠️ 一定要把 card 加进 lay。
+        #
+        #    漏了这一句的后果很隐蔽：card 建出来了、控件也塞进去了，
+        #    但没有任何人引用它，Qt 的垃圾回收会把它连带子控件一起销毁。
+        #    表现是 self.ed_base 指向一个已经死掉的 C++ 对象，
+        #    一碰就报 "Internal C++ object already deleted"。
+        #
+        #    这个 bug 查了很久：先怀疑是重复创建、再怀疑是 layout 嵌套，
+        #    最后才发现就是少了一行 addWidget。
         lay.addWidget(card)
 
         # ── 启动行为 ──
@@ -1658,30 +1750,344 @@ class MainWindow(QMainWindow):
 
         self.api.request_once("/api/paths", body, callback=done)
 
+    def _load_profiles(self, attempt: int = 0) -> None:
+        """拉配置列表，渲染出来。
+
+        ⚠️ 失败不能就这样算了。
+            实测：桌面端刚打开时，如果接口服务还没起来（或者刚好在重启），
+            这个请求会失败。原来的代码失败就 return，
+            界面上永远显示"还没有配置"——用户以为配置丢了。
+
+            现在：失败就重试（最多 4 次，间隔递增），
+            全失败了才显示一句明确的错误，而不是假装空。
+        """
+        def on_fail(msg: str):
+            if attempt < 3:
+                # 接口可能还在启动，等一下再试
+                QTimer.singleShot(
+                    800 * (attempt + 1),
+                    lambda: self._load_profiles(attempt + 1),
+                )
+                if attempt == 0:
+                    self.lbl_engine.setText("正在连后台…")
+            else:
+                self.lbl_engine.setText(f"读不到配置：{msg}")
+                # 显示一个明确的状态，别让用户以为配置丢了
+                self._profile_error = msg
+                self._render_profiles()
+
+        # 每次请求带个序号，只认最后一次的结果。
+        # 切页快了的话会有多个请求在飞，老的晚到会把新的覆盖掉——
+        # 表现是"刚选的那套又跳回去了"。
+        self._prof_seq = getattr(self, "_prof_seq", 0) + 1
+        my_seq = self._prof_seq
+
+        def done(data):
+            if my_seq != getattr(self, "_prof_seq", 0):
+                return  # 已经有更新的请求了，这个结果不要
+            if not isinstance(data, dict) or not data.get("ok"):
+                on_fail((data or {}).get("error") or "接口没回应")
+                return
+            self._profile_error = ""
+            self._profiles = data.get("profiles") or []
+            self._active_pid = data.get("active") or ""
+            self._render_profiles()
+
+            # 当前那套填进编辑区
+            cur = next(
+                (x for x in self._profiles if x["id"] == self._active_pid),
+                self._profiles[0] if self._profiles else None,
+            )
+            if cur:
+                self._selected_pid = cur["id"]
+                self._fill_editor(cur)
+
+        self.api.request_once("/api/engine/profiles", callback=done)
+
+    def _render_profiles(self) -> None:
+        """把配置列表画出来。
+
+        每行三个信息：是不是当前在用的（绿点）、叫什么、用哪个模型。
+        不在用的那套给一个「启用」小按钮；在用的只显示状态，不给按钮。
+
+        样式上特意做了三件事：
+            · 每行高度统一，不因为有没有警告标签而参差
+            · 选中的那行用左侧竖条标识，不用整行灰底（灰底看着像禁用）
+            · 「缺 Key」放到行尾固定位置，不挤着模型名
+        """
+        while self.profile_box.count():
+            it = self.profile_box.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+        if not getattr(self, "_profiles", None):
+            err = getattr(self, "_profile_error", "")
+            lb = QLabel(
+                f"读不到配置：{err}（后台可能还没起来，重开一下这个窗口）"
+                if err else
+                "还没有配置。点下面「＋ 新增一套」。"
+            )
+            lb.setFont(font(11))
+            lb.setWordWrap(True)
+            lb.setStyleSheet(
+                f"color:{C_WARN if err else C_DIM2}; padding:8px 0;"
+            )
+            self.profile_box.addWidget(lb)
+            return
+
+        for prof in self._profiles:
+            is_active = prof["id"] == self._active_pid
+            is_sel = prof["id"] == getattr(self, "_selected_pid", "")
+
+            row = QFrame()
+            row.setObjectName("profrow")
+            row.setCursor(Qt.PointingHandCursor)
+            row.setFixedHeight(44)
+            row.setStyleSheet(
+                "QFrame#profrow {"
+                f" background:{C_INPUT};"
+                f" border:1px solid {C_LINE_HI if is_sel else C_LINE};"
+                f" border-left:3px solid {C_ACCENT if is_sel else 'transparent'};"
+                " border-radius:8px;"
+                "}"
+            )
+
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(12, 0, 12, 0)
+            rl.setSpacing(10)
+
+            # 状态点
+            dot = GlowDot(C_OK if is_active else C_DIM2, 7)
+            rl.addWidget(dot, 0, Qt.AlignVCenter)
+
+            # 名字（固定宽度，让后面的对齐）
+            nm = QLabel(prof.get("name") or "未命名")
+            nm.setFont(font(12, QFont.DemiBold if is_active else QFont.Normal))
+            nm.setStyleSheet(f"color:{C_TEXT if is_active else C_TEXT2};")
+            nm.setFixedWidth(110)
+            rl.addWidget(nm)
+
+            # 模型名
+            md = QLabel(prof.get("model") or "(没填模型)")
+            md.setFont(font(11))
+            md.setStyleSheet(
+                f"color:{C_DIM if prof.get('model') else C_DIM2};"
+            )
+            rl.addWidget(md, 1)
+
+            # 缺 Key 提示：固定位置，不挤着别的
+            if not prof.get("has_key"):
+                warn = QLabel("缺 Key")
+                warn.setFont(font(10))
+                warn.setStyleSheet(f"color:{C_WARN};")
+                warn.setFixedWidth(48)
+                warn.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                rl.addWidget(warn)
+
+            # 右侧：在用的显示状态，不在用的显示启用按钮
+            if is_active:
+                tag = QLabel("✓ 正在用")
+                tag.setFont(font(10))
+                tag.setStyleSheet(f"color:{C_OK};")
+                tag.setFixedWidth(88)
+                tag.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                rl.addWidget(tag)
+            else:
+                act = QPushButton("启用")
+                act.setObjectName("ghost")
+                act.setCursor(Qt.PointingHandCursor)
+                act.setFixedSize(64, 26)
+                act.clicked.connect(
+                    lambda _=False, pid=prof["id"]: self._switch_profile(pid)
+                )
+                rl.addWidget(act)
+
+            def on_click(_e, pid=prof["id"]):
+                self._selected_pid = pid
+                self._render_profiles()
+                cur = next((x for x in self._profiles if x["id"] == pid), None)
+                if cur:
+                    self._fill_editor(cur)
+
+            row.mousePressEvent = on_click
+            self.profile_box.addWidget(row)
+
+    def _fill_editor(self, prof: dict) -> None:
+        """把某一套填进下面的编辑区。"""
+        self.edit_title.setText(f"改「{prof.get('name')}」")
+        self.ed_base.setText(prof.get("base_url") or "")
+        self._set_model_text(prof.get("model") or "")
+
+        # 下拉框里先放当前模型，等测试连接再拉全量
+        self.cmb_engine_model.clear()
+        if prof.get("model"):
+            self.cmb_engine_model.addItem(prof["model"])
+            self.cmb_engine_model.setCurrentIndex(0)
+
+        if prof.get("has_key"):
+            self.ed_key.clear()
+            self.ed_key.setPlaceholderText(f"已保存 · 尾号 {prof.get('key_tail')}")
+            self.lbl_key_state.setText(
+                f"✓ 已有 Key（尾号 {prof.get('key_tail')}）  要换就输入新的"
+            )
+            self.lbl_key_state.setStyleSheet(f"color:{C_OK}; font-size:10.5px;")
+            self.lbl_engine_now.setText(
+                f"正在改：{prof.get('name')}｜{prof.get('model')}"
+            )
+        else:
+            self.ed_key.clear()
+            self.ed_key.setPlaceholderText("还没填")
+            self.lbl_key_state.setText("✗ 这套还没填 Key")
+            self.lbl_key_state.setStyleSheet(f"color:{C_BAD}; font-size:10.5px;")
+            self.lbl_engine_now.setText(f"正在改：{prof.get('name')}")
+
+        self.btn_del_profile.setEnabled(True)
+
+    def _add_profile(self) -> None:
+        """新增一套空白配置，然后让用户填。"""
+        def done(data):
+            if isinstance(data, dict) and data.get("ok"):
+                self.lbl_engine.setText("已新增一套，填好信息点保存")
+                self._load_profiles()
+            else:
+                self.lbl_engine.setText("新增失败")
+
+        self.lbl_engine.setText("正在新增…")
+        self.api.request_once("/api/engine/profiles",
+                              {"action": "add", "name": "新配置"},
+                              callback=done)
+
+    def _delete_profile(self) -> None:
+        pid = getattr(self, "_selected_pid", "")
+        if not pid:
+            return
+        prof = next((x for x in getattr(self, "_profiles", []) if x["id"] == pid), None)
+        name = prof.get("name") if prof else pid
+
+        if QMessageBox.question(
+            self, "确认", f"删掉「{name}」这套配置？"
+        ) != QMessageBox.Yes:
+            return
+
+        def done(data):
+            if isinstance(data, dict) and data.get("ok"):
+                self.lbl_engine.setText("已删除")
+                self._selected_pid = ""
+                self._load_profiles()
+            else:
+                self.lbl_engine.setText("删除失败")
+
+        self.api.request_once("/api/engine/profiles",
+                              {"action": "delete", "id": pid},
+                              callback=done)
+
+    def _switch_profile(self, pid: str) -> None:
+        def done(data):
+            if isinstance(data, dict) and data.get("ok"):
+                self.lbl_engine.setText("已切换")
+                self._load_profiles()
+            else:
+                self.lbl_engine.setText("切换失败")
+
+        self.api.request_once("/api/engine/profiles",
+                              {"action": "switch", "id": pid},
+                              callback=done)
+
     def _load_engine(self) -> None:
         """把当前的模型配置读出来填进界面。key 不显示原文。"""
         def done(data):
             if not isinstance(data, dict) or not data.get("ok"):
                 return
             self.ed_base.setText(data.get("base_url") or "")
-            self.ed_model.setText(data.get("model") or "")
+            self._set_model_text(data.get("model") or "")
             if data.get("has_key"):
-                self.ed_key.setPlaceholderText(
-                    f"已设置（尾号 {data.get('key_tail')}），留空表示不改"
+                # placeholder 要短。
+                # 原来写"已设置（尾号 40e0），留空表示不改"，21 个字，
+                # 在 32px 高的输入框里被截断，用户只看到前半截，
+                # 以为这儿没值。提示信息挪到下面那行状态标签里。
+                self.ed_key.setPlaceholderText(f"已保存 · 尾号 {data.get('key_tail')}")
+                self.lbl_key_state.setText(
+                    f"✓ 已有 Key（尾号 {data.get('key_tail')}）  要换就输入新的，留空表示不改"
                 )
+                self.lbl_key_state.setStyleSheet(f"color:{C_OK}; font-size:10.5px;")
                 self.lbl_engine_now.setText(
-                    f"现在用的是：{data.get('model')} @ {data.get('base_url')}"
+                    f"正在用 {data.get('model')}"
                 )
             else:
                 self.ed_key.setPlaceholderText("还没填")
+                self.lbl_key_state.setText("✗ 还没填 Key")
+                self.lbl_key_state.setStyleSheet(f"color:{C_BAD}; font-size:10.5px;")
                 self.lbl_engine_now.setText("还没配。填完才能派任务。")
 
         self.api.request_once("/api/engine", callback=done)
 
+    def _model_text(self) -> str:
+        """当前选的模型名。"""
+        return self.cmb_engine_model.currentText().strip()
+
+    def _set_model_text(self, name: str) -> None:
+        """把模型名放进下拉框。列表里有就选中，没有就填进去。"""
+        if not name:
+            return
+        idx = self.cmb_engine_model.findText(name)
+        if idx >= 0:
+            self.cmb_engine_model.setCurrentIndex(idx)
+        else:
+            self.cmb_engine_model.setEditText(name)
+
+    def _fetch_models(self) -> None:
+        """去接口问有哪些模型，填进下拉框。
+
+        这是「测试连接」之前的一步：知道有哪些模型，
+        用户就不用猜名字了——猜错一个字母就 404。
+        """
+        base = self.ed_base.text().strip()
+        key = self.ed_key.text().strip()
+        if not base or not key:
+            return
+
+        self.lbl_engine.setText("正在查可用模型…")
+
+        def done(data):
+            if not isinstance(data, dict) or not data.get("ok"):
+                # 查不到就让用户手打，不纠缠
+                self.lbl_engine.setText("查不到模型列表，手动填模型名吧")
+                return
+            models = data.get("models") or []
+            cur = self._model_text()
+
+            self.cmb_engine_model.blockSignals(True)
+            self.cmb_engine_model.clear()
+            self.cmb_engine_model.addItems(models)
+            self.cmb_engine_model.blockSignals(False)
+
+            # 现在用的模型如果在列表里就选它，否则用接口推荐的默认值
+            pick = cur if cur in models else (data.get("default") or "")
+            if pick:
+                self._set_model_text(pick)
+
+            self.lbl_engine.setText(f"查到 {len(models)} 个模型，选好后点测试")
+
+        self.api.request_once(
+            "/api/engine/models",
+            {"base_url": base, "api_key": key},
+            timeout=40, callback=done,
+        )
+
     def _save_engine(self) -> None:
+        """保存到当前选中的那套配置。"""
+        pid = getattr(self, "_selected_pid", "")
+        if not pid:
+            self.lbl_engine.setText("先新增一套配置")
+            return
+
         body = {
+            "action": "update",
+            "id": pid,
             "base_url": self.ed_base.text().strip(),
-            "model": self.ed_model.text().strip(),
+            "model": self._model_text(),
             "api_key": self.ed_key.text().strip(),
         }
         if not body["base_url"] or not body["model"]:
@@ -1692,18 +2098,23 @@ class MainWindow(QMainWindow):
             if isinstance(data, dict) and data.get("ok"):
                 self.lbl_engine.setText("已保存")
                 self.ed_key.clear()
-                self._load_engine()
+                self._load_profiles()
             else:
                 self.lbl_engine.setText("保存失败")
 
         self.lbl_engine.setText("保存中…")
-        self.api.request_once("/api/engine", body, callback=done)
+        self.api.request_once("/api/engine/profiles", body, callback=done)
 
     def _test_engine(self) -> None:
-        """真的发一次请求，确认这套配置能用。"""
+        """真的发一次请求，确认这套配置能用。
+
+        顺手拉一遍模型列表：如果用户填的模型名在列表里没有，
+        说明名字写错了，当场就能看出来，不用等任务报 404。
+        """
+        self._fetch_models()
         body = {
             "base_url": self.ed_base.text().strip(),
-            "model": self.ed_model.text().strip(),
+            "model": self._model_text(),
             "api_key": self.ed_key.text().strip(),
         }
         self.lbl_engine.setText("正在连…")

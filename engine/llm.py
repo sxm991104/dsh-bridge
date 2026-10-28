@@ -21,6 +21,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
+from .ratelimit import RateLimiter
+
 
 class LLMError(Exception):
     """模型调用失败。分清楚是哪一类，后面才好提示用户。"""
@@ -79,53 +81,117 @@ class LLM:
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        # 这个 Key 这家服务的频率限制。撞过 429 之后它就知道该隔多久。
+        self.limiter = RateLimiter()
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None,
              max_tokens: int = 8192, temperature: float = 0.3) -> Reply:
-        """发一轮对话，返回模型的话（可能带工具调用）。"""
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+        """发一轮对话，返回模型的话（可能带工具调用）。
 
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            self.url,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
-        )
+        temperature 的处理有个坑：
+            各家对它的宽容度不一样。实测 kimi-k2.6 只接受 1，
+            发 0.3 直接 400：
+                "invalid temperature: only 1 is allowed for this model"
 
-        raw = self._send(req)
-        return self._parse(raw)
+            所以这里不做"聪明"的适配——先按传入的值发，
+            如果对方因为参数不对拒了，就去掉这个参数重发一次。
+            OpenAI 兼容服务全都接受"不传 temperature"。
+        """
+        def build(include_temp: bool) -> bytes:
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+            }
+            if include_temp:
+                payload["temperature"] = temperature
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = "auto"
+            return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        def make_req(body: bytes) -> urllib.request.Request:
+            return urllib.request.Request(
+                self.url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                },
+                method="POST",
+            )
+
+        try:
+            return self._parse(self._send(make_req(build(True))))
+        except LLMError as e:
+            msg = str(e).lower()
+            # 只对这几种参数问题重试，别把真正的错误也吞掉
+            if any(k in msg for k in ("temperature", "max_tokens", "top_p")):
+                return self._parse(self._send(make_req(build(False))))
+            raise
 
     def _send(self, req: urllib.request.Request) -> dict:
-        """发请求，网络类错误重试两次。"""
+        """发请求，遇到限流和临时故障会等一下再试。
+
+        为什么要专门处理 429：
+            实测 kimi-k2.6 的免费额度是**每分钟 3 次请求**，
+            而跑一个任务要好几轮（每轮一次请求），很容易撞上。
+            不重试的话，任务跑到一半就废了，用户看到的只是
+            "接口返回 429"——他不知道自己该等多久，也不知道该干什么。
+
+            所以这里等：先 5 秒，再 10 秒、20 秒……
+            服务端如果在响应里说了"再等几秒"，就照它说的等。
+        """
         last_err: Exception | None = None
-        for attempt in range(3):
+        # 最多试 5 次。限额很紧的服务（比如每分钟 3 次）也能熬过去。
+        for attempt in range(5):
+            # 上一轮撞限流的话，这里会等到安全时刻再发
+            self.limiter.wait()
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    return json.loads(r.read().decode("utf-8"))
+                    data = json.loads(r.read().decode("utf-8"))
+                self.limiter.mark_ok()
+                return data
             except urllib.error.HTTPError as e:
                 detail = ""
                 try:
                     detail = e.read().decode("utf-8", "replace")[:400]
                 except Exception:  # noqa: BLE001
                     pass
-                # 4xx 是配置/请求问题，重试没用，直接抛
-                if 400 <= e.code < 500 and e.code not in (408, 429):
+
+                # 429：限流。
+                #
+                # 不能只按它说的 "after 1 second" 等——那个 1 秒是
+                # 通用话术，实际限制是"每分钟 3 次"，等 1 秒还在同一窗口。
+                # 交给 limiter：它会从错误信息里读出真实 RPM，
+                # 算出"下一次安全时刻"。
+                if e.code == 429:
+                    gap = self.limiter.on_429(detail)
+                    rpm = self.limiter.rpm
+                    if rpm:
+                        desc = f"这台服务每分钟最多 {rpm} 次请求"
+                    else:
+                        desc = "这台服务有频率限制"
+                    last_err = LLMError(
+                        f"请求太快了，{desc}。已经等了一会儿，再试一次。"
+                    )
+                    if attempt < 4:
+                        time.sleep(min(60.0, gap))
+                        continue
+                    raise LLMError(
+                        f"{desc}，连续重试 {attempt + 1} 次还是被拒。"
+                        "这个任务需要多轮对话，用免费额度可能跑不完——"
+                        "换一个限额更宽的 Key，或者等一会儿再派。"
+                    ) from None
+
+                # 其它 4xx 是配置问题，重试没用
+                if 400 <= e.code < 500 and e.code != 408:
                     raise LLMError(
                         f"接口返回 {e.code}。{_explain_http(e.code)}"
                         f"详情：{detail}"
                     ) from None
+
+                # 5xx 和超时：临时故障，等一下再试
                 last_err = LLMError(f"接口返回 {e.code}：{detail}")
             except urllib.error.URLError as e:
                 last_err = LLMError(f"连不上接口：{e.reason}")
@@ -134,10 +200,29 @@ class LLM:
             except json.JSONDecodeError:
                 last_err = LLMError("接口返回的不是 JSON")
 
-            if attempt < 2:
+            if attempt < 4:
                 time.sleep(2 * (attempt + 1))
 
         raise last_err or LLMError("调用失败")
+
+    @staticmethod
+    def _retry_after(detail: str, default: float) -> float:
+        """从错误信息里读"该等几秒"。
+
+        各家写法不一样：
+            kimi:    "please try again after 1 seconds"
+            openai:  响应头里有 Retry-After（这里读不到，只能看正文）
+        读不到就用默认的指数退避。
+        """
+        import re
+
+        m = re.search(r"after\s+(\d+)\s*second", detail, re.I)
+        if m:
+            try:
+                return min(60.0, max(1.0, float(m.group(1))))
+            except ValueError:
+                pass
+        return min(60.0, default)
 
     def _parse(self, data: dict) -> Reply:
         """把 OpenAI 格式的返回拆成 Reply。

@@ -801,9 +801,20 @@ def _invoke_engine(task: str, timeout: int, task_id: str = "") -> dict | None:
     if not engine_bridge.is_configured():
         return None
 
+    # 用这个任务自己记的配置跑，不是"当前默认那套"。
+    # 多套配置同时启用时，任务各跑各的模型。
+    profile_id = ""
+    try:
+        for t in _read_tasks():
+            if t.get("id") == task_id:
+                profile_id = t.get("profile") or ""
+                break
+    except Exception:  # noqa: BLE001
+        pass
+
     workdir = _task_workdir(task_id) if task_id else BRIDGE_DIR
     try:
-        return engine_bridge.dispatch(task, task_id, workdir)
+        return engine_bridge.dispatch(task, task_id, workdir, profile_id=profile_id)
     except Exception as e:  # noqa: BLE001
         return {
             "status": "error",
@@ -1163,14 +1174,30 @@ def _invoke_dsh(task: str, timeout: int, task_id: str = "") -> dict:
 # ----------------------------------------------------------------------
 
 
-def cmd_dispatch(task_text: str, task_id: str = "") -> dict:
-    """派活：只记一条，不执行。立刻返回。"""
+def cmd_dispatch(task_text: str, task_id: str = "", profile: str = "") -> dict:
+    """派活：只记一条，不执行。立刻返回。
+
+    profile 是"用哪套模型配置跑"。空的话用默认那套。
+    多套配置是同时启用的，各自有并发额度——
+    这套满了就排进这套的队列，不影响别套。
+    """
     if not task_id:
         task_id = "t-" + datetime.now().strftime("%Y%m%d%H%M%S")
+
+    # 定哪套配置
+    profile_id = (profile or "").strip()
+    if not profile_id:
+        try:
+            import engine.profiles as _P
+
+            profile_id = (_P.default_profile() or {}).get("id") or ""
+        except Exception:  # noqa: BLE001
+            profile_id = ""
 
     rec = {
         "id": task_id,
         "task": task_text,
+        "profile": profile_id,
         "status": "pending",
         "created_at": _now(),
         "updated_at": _now(),
@@ -1205,6 +1232,7 @@ def cmd_dispatch(task_text: str, task_id: str = "") -> dict:
     write_state(
         task_id,
         status="pending",
+        profile=profile_id,
         task=(task_text or "")[:200],
         created_at=rec["created_at"],
         turns=0,
@@ -1550,6 +1578,9 @@ def main() -> int:
     p_dis = sub.add_parser("dispatch", help="派一条任务，立刻返回")
     p_dis.add_argument("task")
     p_dis.add_argument("--id", default="")
+    # 用哪套模型配置。留空用默认那套。
+    # 多套配置同时启用时，每个任务各跑各的模型。
+    p_dis.add_argument("--profile", default="")
 
     p_run = sub.add_parser("run", help="执行一条任务（后台用）")
     p_run.add_argument("--id", required=True)
@@ -1582,7 +1613,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.cmd == "dispatch":
-        print(json.dumps(cmd_dispatch(args.task, args.id), ensure_ascii=False))
+        print(json.dumps(cmd_dispatch(args.task, args.id, getattr(args, "profile", "")), ensure_ascii=False))
         return 0
     if args.cmd == "run":
         rec = cmd_run(args.id, args.timeout)
