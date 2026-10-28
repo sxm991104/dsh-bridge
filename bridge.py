@@ -637,30 +637,92 @@ def _activity_from_events(lines: list[str]) -> str:
     return last_tool or last_text
 
 
+def _child_pids_snapshot(root_pid: int) -> set[int]:
+    """在杀之前，先把这棵树的子孙 PID 全抓下来。
+
+    为什么要抓快照再杀：
+        dsh 拉起的不只是 node.exe，还有它自己再拉的
+        DeepSeek Harness.exe 子进程。任务被强杀时，
+        这些孙进程有时会脱离父进程树——taskkill /T 就够不着了。
+        它们还握着会话的写句柄，于是下次再跑同一个任务就报
+        session is already owned by an active write handle，
+        而且从外面清不掉（锁根本不在文件里，我查了半天）。
+
+        实测：4 个这样的僵尸挂了半小时以上，内存只有 4MB，
+        状态看着像在跑，其实早死了。
+
+    所以顺序改成：先记下所有子孙 -> 再杀树 -> 再按记下的 PID 补刀。
+    """
+    try:
+        out = subprocess.run(
+            ["wmic", "process", "get", "ProcessId,ParentProcessId", "/format:csv"],
+            capture_output=True, timeout=15,
+        ).stdout.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return set()
+
+    parent_of: dict[int, int] = {}
+    for line in out.splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            ppid, pid = int(parts[1]), int(parts[2])
+        except (ValueError, IndexError):
+            continue
+        parent_of[pid] = ppid
+
+    found: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for pid, ppid in parent_of.items():
+            if pid in found:
+                continue
+            if ppid == root_pid or ppid in found:
+                found.add(pid)
+                changed = True
+    return found
+
+
 def _kill_tree(proc: subprocess.Popen) -> None:
-    """超时后连根拔掉，别留孤儿 node 进程在后台空转。
+    """超时后连根拔掉，别留孤儿进程在后台占着会话不放。
 
     dsh.cmd 是批处理，proc 只是 cmd.exe。
-    taskkill /T 才收得掉整棵树；收不掉就退回只杀这一个。
+    taskkill /T 收不掉脱离父树的孙进程，所以分三步：
+        1. 先抓子孙 PID 快照
+        2. taskkill /T 杀树
+        3. 按快照补刀（只杀我们记下的，不碰别的）
     """
-    if proc.poll() is not None:
-        return
-    try:
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-            capture_output=True,
-            timeout=15,
-        )
-    except Exception:  # noqa: BLE001  没 taskkill（非 Windows）就算了
-        pass
-    try:
-        proc.kill()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        proc.wait(timeout=10)
-    except Exception:  # noqa: BLE001
-        pass
+    children = _child_pids_snapshot(proc.pid)
+
+    if proc.poll() is None:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=15,
+            )
+        except Exception:  # noqa: BLE001  没 taskkill（非 Windows）就算了
+            pass
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 补刀：只杀刚才抓到的那些
+    for pid in children:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, timeout=10,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ----------------------------------------------------------------------
@@ -721,6 +783,37 @@ def _wrap_task(task: str) -> str:
     return task.rstrip() + TASK_RULES.format(ask_file=ASK_FILE, now=now)
 
 
+def _invoke_engine(task: str, timeout: int, task_id: str = "") -> dict | None:
+    """用自研引擎跑任务。没配置好就返回 None，让调用方退回 DSH。
+
+    为什么保留"退回 DSH"这条路：
+        用户还没填 model 配置时，如果直接报错，他连"怎么跑起来的"
+        都看不到。宁可先退回能跑的老路，让他先用上，
+        再到设置页去填自己的 Key。
+
+    配置好之后，DSH 就完全用不上了——不用装 Node，不用装 DSH。
+    """
+    try:
+        import engine_bridge
+    except Exception:  # noqa: BLE001
+        return None
+
+    if not engine_bridge.is_configured():
+        return None
+
+    workdir = _task_workdir(task_id) if task_id else BRIDGE_DIR
+    try:
+        return engine_bridge.dispatch(task, task_id, workdir)
+    except Exception as e:  # noqa: BLE001
+        return {
+            "status": "error",
+            "result": "",
+            "error": f"引擎出错：{type(e).__name__}: {e}",
+            "seconds": 0.0,
+            "session_id": "",
+        }
+
+
 def _invoke_dsh(task: str, timeout: int, task_id: str = "") -> dict:
     """跑一次 dsh qqme，复用会话。
 
@@ -739,9 +832,21 @@ def _invoke_dsh(task: str, timeout: int, task_id: str = "") -> dict:
         现在自己起进程 + 定时器：超时就 kill 整棵树，顺便每 HEARTBEAT_SECONDS
         秒盖一个心跳章，status 才能看出活没活着。
     """
+    # 优先走自研引擎。配好了的话，下面那一整套 DSH 的东西全不用碰。
+    rec = _invoke_engine(task, timeout, task_id)
+    if rec is not None:
+        return rec
+
     dsh_cmd = find_dsh()
     if not dsh_cmd:
-        return {"status": "error", "error": "找不到 dsh 命令（也找不到 node + bin.js）"}
+        return {
+            "status": "error",
+            "error": (
+                "任务端还没配模型。去桌面端「设置 → 任务端模型」"
+                "填上接口地址和 Key 就能用；"
+                "在那之前需要装 DeepSeek Harness 才能跑。"
+            ),
+        }
 
     child_env = dict(os.environ)
     child_env["PYTHONIOENCODING"] = "utf-8"
@@ -1309,6 +1414,77 @@ def cmd_cancel(task_id: str) -> dict:
     return {"id": task_id, "status": "cancelled", "killed": killed, **(final or {})}
 
 
+def reap_dead(stale_seconds: int = 180) -> list[str]:
+    """把已经死掉但还挂着 running 的任务收掉。
+
+    ⚠️ 这是断网暴露出来的真问题：
+
+        用户换网之后，任务那边的连接断了，进程死了，
+        心跳也停了。但 tasks.jsonl 里还写着 running，
+        于是：
+            用户看到      → "还在跑"
+            live 算出     → alive=False
+            实际          → 早就死了
+        过去的实现只把 alive 算出来给人看，**没有据此收尸**，
+        于是状态永远是 running，用户一直等一个不会来的结果。
+
+        现实里这种场景很常见：断网、切换网络、机器休眠、
+        进程被系统杀掉、用户手动关了终端。
+
+    怎么判断死了：
+        · 心跳超过 stale_seconds 秒没更新（默认 180 秒）
+        · 而且 Progress 文件里记的正是这个任务
+
+    收到什么状态：
+        标记成 timeout，错误写"进程失联"，并写进 outbox 让前台知道。
+        不用 error —— error 像是任务自己跑挂了，timeout 更像"没跑完就断了"，
+        而且 timeout 能触发用户"重跑一次"的直觉。
+
+    返回：被收掉的任务名列表。
+    """
+    prog = _read_progress()
+    if not prog:
+        return []
+    tid = prog.get("id")
+    if not tid:
+        return []
+
+    hb = prog.get("heartbeat_at") or ""
+    try:
+        beat = datetime.fromisoformat(hb).timestamp()
+    except (TypeError, ValueError):
+        return []
+    age = time.time() - beat
+    if age <= stale_seconds:
+        return []
+
+    # 确认这个任务确实还挂着 running
+    tasks = _read_tasks()
+    target = None
+    for t in tasks:
+        if t.get("id") == tid and t.get("status") == "running":
+            target = t
+            break
+    if target is None:
+        # 已经收过了，只把过期的 Progress 清掉
+        _clear_progress()
+        return []
+
+    mins = int(age // 60)
+    err = f"进程失联（心跳停了 {mins} 分钟，可能断网或被系统终止）"
+    _update_task(
+        tid,
+        status="timeout",
+        error=err,
+        finished_at=_now(),
+    )
+    write_state(tid, status="timeout", error=err, finished_at=_now())
+    notify_outbox(tid, {"id": tid, "status": "timeout", "error": err}, target.get("task", ""))
+    _clear_progress()
+    _log_quiet(f"收掉失联任务 {tid}（心跳停了 {mins} 分钟）")
+    return [tid]
+
+
 def cmd_status(task_id: str = "", limit: int = 5) -> dict | list:
     tasks = _read_tasks()
     if task_id:
@@ -1338,11 +1514,26 @@ def cmd_live() -> dict:
         prog["heartbeat_age_seconds"] = age
         prog["alive"] = None if age is None else age <= HEARTBEAT_SECONDS * 3
 
+    # 顺手把已经死透的任务收掉，别让它一直挂着 running 骗人
+    reaped = reap_dead()
+    if reaped:
+        prog = _read_progress()
+        if prog:
+            hb = prog.get("heartbeat_at") or ""
+            try:
+                beat = datetime.fromisoformat(hb).timestamp()
+                prog["heartbeat_age_seconds"] = round(time.time() - beat, 1)
+                prog["alive"] = prog["heartbeat_age_seconds"] <= HEARTBEAT_SECONDS * 3
+            except (TypeError, ValueError):
+                prog["heartbeat_age_seconds"] = None
+                prog["alive"] = None
+
     running = [t for t in _read_tasks() if t.get("status") == "running"]
     return {
         "now": _now(),
         "running_tasks": running,
         "progress": prog,
+        "reaped": reaped,
         "note": "progress 为空 = 当前没有子进程在跑",
     }
 
