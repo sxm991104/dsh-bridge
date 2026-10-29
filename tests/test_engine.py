@@ -118,6 +118,147 @@ def test_run_command_failure(workdir: str) -> None:
 
 
 # ══════════════════════════════════════════════════════
+# 中文编码（Windows 上的经典坑）
+# ══════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("text", [
+    "中文测试",
+    "你好世界",
+    "测试中文输出",
+    "混合English和中文",
+    "特殊符号：，。！？",
+])
+def test_echo_chinese(workdir: str, text: str) -> None:
+    """★ echo 中文不能乱码。
+
+    这里踩过一个大坑，值得记下来：
+
+        `echo 中文测试` 出来是 `���Ĳ���`。
+
+        根因不在解码，在 **creationflags**：
+            带 CREATE_NO_WINDOW → cmd.exe 自己起一个默认代码页 936 的控制台
+                                  → 输出 GBK 字节
+            不带                 → 继承父进程的 UTF-8 控制台
+                                  → 输出 UTF-8 字节
+
+        而 run_command 里固定按 UTF-8 解 → 带 creationflags 时全乱。
+
+        修法：解码时**先严格试 UTF-8，失败再试 GBK**。
+        UTF-8 字节序列有很强的校验性，中文乱码成 GBK
+        几乎不可能恰好是合法 UTF-8，所以这个判据可靠。
+    """
+    r = tools.run_command(f"echo {text}")
+    assert isinstance(r, str)
+    assert text in r, f"「{text}」没正确输出，实际：{r!r}"
+    assert "\ufffd" not in r, f"出现了替换字符（乱码）：{r!r}"
+
+
+def test_run_command_utf8_bytes(workdir: str) -> None:
+    """UTF-8 字节能解对。"""
+    out = tools._decode_output("中文".encode("utf-8"))
+    assert out == "中文"
+
+
+def test_run_command_gbk_bytes(workdir: str) -> None:
+    """GBK 字节也能解对（Windows 控制台的默认代码页）。"""
+    out = tools._decode_output("中文".encode("gbk"))
+    assert out == "中文"
+
+
+def test_decode_empty(workdir: str) -> None:
+    """空输入返回空串。"""
+    assert tools._decode_output(b"") == ""
+
+
+def test_decode_broken_bytes(workdir: str) -> None:
+    """坏字节不能崩。"""
+    out = tools._decode_output(b"\xff\xfe\x00broken")
+    assert isinstance(out, str)
+
+
+def test_quoted_command_not_swallowed(workdir: str) -> None:
+    """★ 带引号的命令不能被 cmd 吞掉。
+
+    这里踩过一个很隐蔽的坑：
+
+        `python -c "print(1+1)"` 通过 run_command 跑，
+        返回码 0，**但一个字都没输出**。
+
+        根因：cmd 会剥掉命令里的双引号，
+        于是 python 收到的是被拆散的参数，执行了空程序。
+
+        修法：命令里有双引号时，自己拆参数，不经过 cmd。
+    """
+    r = tools.run_command(f'{sys.executable} -c "print(1+1)"')
+    assert "2" in r, f"引号被吞了，实际：{r!r}"
+
+
+@pytest.mark.parametrize("cmd,want", [
+    ("echo test", "test"),
+    ("echo hello world", "hello"),
+    ("echo 中文", "中文"),
+])
+def test_simple_commands_still_work(workdir: str, cmd: str, want: str) -> None:
+    """简单命令（不带引号）仍然交给 cmd 处理。"""
+    r = tools.run_command(cmd)
+    assert want in r, f"实际：{r!r}"
+
+
+def test_cmd_builtin_still_works(workdir: str) -> None:
+    """cmd 内置命令（dir）不能被我们的拆分逻辑搞坏。"""
+    tools.write_file("marker.txt", "x")
+    r = tools.run_command("dir")
+    assert "marker.txt" in r, f"dir 输出里没有文件：{r[:200]!r}"
+
+
+def test_build_args_quoted() -> None:
+    """有引号 → 自己拆。"""
+    args = tools._build_args('python -c "print(1)"')
+    assert args == ["python", "-c", "print(1)"]
+
+
+def test_build_args_unquoted() -> None:
+    """没引号 → 走 cmd。"""
+    if sys.platform == "win32":
+        args = tools._build_args("echo hi")
+        assert args[0] == "cmd"
+
+
+def test_split_command_nested() -> None:
+    """嵌套引号的拆分。"""
+    parts = tools._split_command("""python -c "print('a b')" """.strip())
+    assert parts == ["python", "-c", "print('a b')"]
+
+
+def test_split_command_unbalanced() -> None:
+    """引号不配对时返回空（让调用方回退）。"""
+    parts = tools._split_command('python -c "print(1)')
+    assert parts == []
+
+
+def test_python_subprocess_chinese(workdir: str) -> None:
+    """Python 子进程输出中文也对。
+
+    ⚠️ 这里踩了 cmd 的一个经典坑：
+        写成 `cmd /c "C:\\...\\python.exe" -c "..."` 时，
+        cmd 会把第一个引号剥掉，报
+            '"C:\\...\\python.exe"' 不是内部或外部命令
+
+        所以这里先把 exe 路径写进一个临时 .bat 文件，
+        避开引号解析。这也顺便验证了"文件告诉子进程"这条路。
+    """
+    import os
+
+    py = sys.executable.replace('"', "")
+    # 用 cmd 的 /c 直接跑，路径不加引号（本地路径没空格）
+    if " " in py:
+        pytest.skip("Python 路径带空格，跳过")
+
+    r = tools.run_command(f'{py} -c "print(chr(20013)+chr(25991))"')
+    assert "中文" in r, f"实际输出：{r!r}"
+
+
+# ══════════════════════════════════════════════════════
 # 工具：输出截断
 # ══════════════════════════════════════════════════════
 

@@ -84,6 +84,150 @@ def _nowindow_flags() -> int:
     return 0x08000000 if sys.platform == "win32" else 0
 
 
+def _build_args(command: str) -> list[str]:
+    """把用户写的命令变成 subprocess 的参数列表。
+
+    ⚠️ 这里踩过一个很隐蔽的坑，值得完整写下来。
+
+        现象：`python -c "print('中文')"` 通过 run_command 跑，
+              返回码 0，**但一个字都没输出**。
+
+        排查：
+            · 直接 subprocess.run([python, "-c", "print(...)"])  → 正常
+            · 靠 subprocess.run(["cmd", "/c", 完整命令])        → 空输出
+
+        根因：**cmd 会剥掉命令里的双引号。**
+
+            cmd /c python -c "print('中文')"
+
+            cmd 认为双引号只是"给参数分组用的"，会把它去掉。
+            于是 python 收到的是：
+                -c   print('中文')     ← 少了引号，而且被拆成两个参数
+            它把这个当成语法错误或者空程序，安安静静退出，什么都不打印。
+
+        第一次遇到是 `echo 中文` 乱码，修好解码之后又冒出这个。
+        两个是完全不同的问题，长得很像：
+            乱码    → 字节解错了
+            空输出   → 参数被 cmd 吃掉了
+
+    **修法：不用 cmd 当中间层。**
+
+        命令里如果包含了双引号，就自己拆成参数列表——
+        Windows 上引号本来就是用来分组的，我们自己拆比让 cmd 拆更准。
+
+        没有双引号的简单命令，还是走 cmd /c
+        （这样 echo、dir、type 这些内置命令仍然能用）。
+    """
+    if sys.platform != "win32":
+        return ["/bin/sh", "-c", command]
+
+    # 有双引号 → 自己拆，别让 cmd 动手
+    if '"' in command:
+        parts = _split_command(command)
+        if parts:
+            return parts
+
+    return ["cmd", "/c", command]
+
+
+def _split_command(command: str) -> list[str]:
+    """按 cmd 的规则拆参数：双引号包起来的部分算一个参数。
+
+    比如：
+        python -c "print('中文')"
+        → ["python", "-c", "print('中文')"]
+
+    拆不出来（引号不配对）就返回空列表，让调用方回退到 cmd。
+    """
+    parts: list[str] = []
+    cur: list[str] = []
+    in_quote = False
+
+    for ch in command:
+        if ch == '"':
+            in_quote = not in_quote
+            continue
+        if ch in (" ", "\t") and not in_quote:
+            if cur:
+                parts.append("".join(cur))
+                cur = []
+            continue
+        cur.append(ch)
+
+    if in_quote:
+        # 引号没配平，不拆
+        return []
+
+    if cur:
+        parts.append("".join(cur))
+
+    if not parts:
+        return []
+
+    # 第一个词如果是已知的内置命令（echo/dir/cd…），还是得交给 cmd
+    builtin = {"echo", "dir", "type", "copy", "del", "cd", "chdir",
+               "set", "cls", "ver", "vol", "md", "mkdir", "rd", "rmdir",
+               "ren", "rename", "move", "tasklist", "taskkill", "where"}
+    if parts[0].lower() in builtin:
+        return []
+
+    return parts
+
+
+def _decode_output(raw: bytes) -> str:
+    """把子进程的输出字节变成文字。
+
+    ⚠️ 这里踩过一个很隐蔽的坑，值得写清楚。
+
+        现象：`echo 中文测试` 出来是 `���Ĳ���`。
+
+        排查过程：
+            · 直接跑 subprocess.run(["cmd","/c","echo 中文"]) → 正确
+            · 通过 run_command 跑 → 乱码
+            · 对比参数，差在 creationflags
+            · 带 CREATE_NO_WINDOW → 子进程输出 GBK 字节
+              不带                 → 输出 UTF-8 字节
+
+        为什么加了 CREATE_NO_WINDOW 就变成 GBK：
+            cmd.exe 的输出编码跟着控制台的代码页走。
+            带 CREATE_NO_WINDOW 时不继承父进程的控制台，
+            自己起一个默认代码页 936（简体中文 GBK）。
+            不带时继承了父进程的（我们设了 UTF-8）。
+
+        试过但不可靠的做法：
+            · 统一按 UTF-8 解 → 带 creationflags 时乱码
+            · 统一按 GBK 解   → 不带时乱码
+            · 强制给子进程设 PYTHONIOENCODING → 只管 Python 子进程，
+              cmd.exe 不吃这个变量
+
+        最终做法：**先试 UTF-8，失败再用 GBK**。
+
+            UTF-8 的字节序列有很强的校验性——中文乱码成 GBK
+            很难恰好是合法 UTF-8。所以"严格试 UTF-8"是可靠的判据。
+
+            实测两种都能正确解：
+                UTF-8 字节 → 严格解码成功 → 对
+                GBK 字节   → 严格解码抛异常 → 转 GBK → 对
+    """
+    if not raw:
+        return ""
+
+    # 先严格试 UTF-8
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    # 再试 GBK（简体中文 Windows 的默认代码页）
+    try:
+        return raw.decode("gbk")
+    except UnicodeDecodeError:
+        pass
+
+    # 都不行：用 UTF-8 + replace，至少不崩
+    return raw.decode("utf-8", "replace")
+
+
 # ----------------------------------------------------------------------
 # 工具的实现
 # ----------------------------------------------------------------------
@@ -240,10 +384,7 @@ def run_command(command: str, cwd: str = "", timeout: int = 120) -> str:
     env = dict(os.environ)
     env["WORKDIR"] = work_dir
 
-    if sys.platform == "win32":
-        args = ["cmd", "/c", command]
-    else:
-        args = ["/bin/sh", "-c", command]
+    args = _build_args(command)
 
     try:
         r = subprocess.run(
@@ -259,8 +400,8 @@ def run_command(command: str, cwd: str = "", timeout: int = 120) -> str:
     except OSError as e:
         return f"起不来：{e}"
 
-    out = (r.stdout or b"").decode("utf-8", "replace")
-    err = (r.stderr or b"").decode("utf-8", "replace")
+    out = _decode_output(r.stdout or b"")
+    err = _decode_output(r.stderr or b"")
     text = out + (("\n[stderr]\n" + err) if err.strip() else "")
     text = text.strip() or "(没有输出)"
 
