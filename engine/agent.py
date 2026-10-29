@@ -93,7 +93,10 @@ def run(task: str, workdir: str, llm: LLM, max_steps: int = 40,
             on_progress(prog)
 
         try:
-            reply = llm.chat(messages, tools=tools.TOOL_SPECS)
+            reply = llm.chat(
+                messages, tools=tools.TOOL_SPECS,
+                max_tokens=_pick_max_tokens(messages, step),
+            )
         except LLMError as e:
             # 模型调不通是致命错误，整轮结束
             messages.append({
@@ -167,6 +170,33 @@ def _save(workdir: str, messages: list[dict], prog: Progress) -> None:
         sess.save(workdir, messages, prog.prompt_tokens, prog.completion_tokens)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _pick_max_tokens(messages: list[dict], step: int) -> int:
+    """按情况给 max_tokens。
+
+    为什么要动态给：
+        原来固定 8192。对**思考型模型**（比如 kimi-k2.6）来说，
+        这个数字会诱导它想很久——实测一个"只回复两个字"的任务
+        要 20 秒，而同样的活 DeepSeek 一两秒就完了。
+
+        真实的浪费在哪儿：
+            · 前面几轮它主要在决定"要不要调工具"，不需要写长文
+            · 只有最后那轮（它要交差）才需要把话说完整
+
+        所以：
+            前几轮  给 1024 —— 够它描述要调什么工具
+            后面轮  给 4096 —— 留够写结果的空间
+
+        ⚠️ 不能给太小：思考型模型的 reasoning token 也算在
+            max_tokens 里。给 20 的时候实测它想完就没额度说话了，
+            回复是空的。
+    """
+    # 还没有任何工具调用 → 它还在准备阶段
+    has_tool_round = any(m.get("role") == "tool" for m in messages)
+    if not has_tool_round and step <= 1:
+        return 1024
+    return 4096
 
 
 def _describe(name: str, args: str) -> str:

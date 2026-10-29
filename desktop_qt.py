@@ -134,6 +134,67 @@ def font(size: int = 13, weight: int = 400) -> QFont:
 # 后台请求
 # ────────────────────────────────────────────────────────────────────
 
+def _read_api_token() -> str:
+    """读桥接口的访问 token。
+
+    桥启动时会生成它（在用户目录下的 dsh-bridge/api_token.txt），
+    桌面端每次启动读一次，请求时带上。
+
+    ⚠️ 为什么要 token：
+        那个接口能派活、能读写文件、能跑命令。
+        只靠"绑了 127.0.0.1"是单薄的一道墙——
+        本机上任何一个程序、任何一个网页都能来调。
+        加个 token，本机别的程序就算知道端口也调不动。
+    """
+    import os
+
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    p = os.path.join(base, "dsh-bridge", "api_token.txt")
+    try:
+        if os.path.exists(p):
+            return open(p, encoding="utf-8").read().strip()
+    except OSError:
+        pass
+    return ""
+
+
+# 启动时读一次，之后每次请求会重新读。
+#
+# ⚠️ 为什么不能只在启动时读一次：
+#     桌面端和接口服务是两个进程，谁先起来不确定。
+#     用户先开桌面端、后开接口服务的时候，桌面端启动时
+#     那个文件还不存在，读到空字符串 → 之后所有请求都 401。
+#     表现是"界面全空，像坏了"。
+#
+#     文件很小（44 字节），每次读一下几乎不花时间。
+_API_TOKEN_CACHE = {"t": _read_api_token()}
+
+
+def _token() -> str:
+    """拿 token。没有就去读，读到就缓存。"""
+    if _API_TOKEN_CACHE["t"]:
+        return _API_TOKEN_CACHE["t"]
+    t = _read_api_token()
+    if t:
+        _API_TOKEN_CACHE["t"] = t
+    return t
+
+
+# 兼容旧引用
+class _TokenProxy:
+    def __str__(self) -> str:
+        return _token()
+
+    def __eq__(self, other) -> bool:
+        return _token() == other
+
+    def __bool__(self) -> bool:
+        return bool(_token())
+
+
+API_TOKEN = _TokenProxy()
+
+
 class Api(QObject):
     # request_once 的专用通道。
     #
@@ -180,7 +241,10 @@ class Api(QObject):
 
     def _get(self, path: str) -> None:
         try:
-            with urllib.request.urlopen(API + path, timeout=6) as r:
+            req = urllib.request.Request(
+                API + path, headers={"X-Token": _token()}
+            )
+            with urllib.request.urlopen(req, timeout=6) as r:
                 self.done.emit(path, json.loads(r.read()))
         except Exception:  # noqa: BLE001
             self.done.emit(path, None)
@@ -192,13 +256,19 @@ class Api(QObject):
         def run():
             try:
                 if body is None:
-                    with urllib.request.urlopen(API + path, timeout=timeout) as r:
+                    req = urllib.request.Request(
+                        API + path, headers={"X-Token": _token()}
+                    )
+                    with urllib.request.urlopen(req, timeout=timeout) as r:
                         data = json.loads(r.read())
                 else:
                     req = urllib.request.Request(
                         API + path,
                         data=json.dumps(body).encode(),
-                        headers={"Content-Type": "application/json"},
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Token": _token(),
+                        },
                         method="POST",
                     )
                     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -234,7 +304,10 @@ class Api(QObject):
             req = urllib.request.Request(
                 API + path,
                 data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Token": _token(),
+                },
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -1038,7 +1111,7 @@ class MainWindow(QMainWindow):
         #    胶囊变成三个高瘦的长条，中间还露出奇怪的竖线。
         #    必须显式 setFixedHeight，并且用 AlignVCenter 传到布局里。
         self.pills = {}
-        for key, label in (("qq", "QQ"), ("bot", "对话"), ("bridge", "任务端")):
+        for key, label in (("qq", "QQ"), ("feishu", "飞书"), ("bridge", "任务端")):
             pill = QFrame()
             pill.setFixedHeight(26)
             pill.setStyleSheet(
@@ -1081,7 +1154,7 @@ class MainWindow(QMainWindow):
         self.nav_btns[0].setChecked(True)
 
         lay.addStretch()
-        ver = QLabel("v1.0.0")
+        ver = QLabel("v1.3.0")
         ver.setFont(font(10))
         ver.setStyleSheet(f"color:{C_DIM2}; padding:0 16px;")
         lay.addWidget(ver)
@@ -1094,6 +1167,7 @@ class MainWindow(QMainWindow):
         if idx == 2:
             self._load_profiles()
             self._load_paths()
+            self._load_guard()
             self._refresh_autostart()
 
     # ── 任务页 ──
@@ -1209,22 +1283,40 @@ class MainWindow(QMainWindow):
         h = QLabel("服务")
         h.setFont(font(19, QFont.Bold))
         h.setStyleSheet(f"color:{C_TEXT};")
-        sub = QLabel("这三样都在跑，整套才能用。")
+        sub = QLabel("用哪个开哪个，没开的不会启动。")
         sub.setFont(font(12))
         sub.setStyleSheet(f"color:{C_DIM};")
         lay.addWidget(h)
         lay.addWidget(sub)
 
+        # ⚠️ 这里从"三样都开"改成了"按需开"。
+        #
+        #    原来点一次启动，QQ 和飞书一起连上：
+        #        QQ   → 拉 QQ 客户端（几百兆）
+        #        飞书 → 只是网络连接（几十兆）
+        #    只用飞书的人白背着 QQ，低配机器直接卡。
+        #
+        #    现在两条通道各一个开关，没点的不启动。
+        #    任务端跟通道无关，单独一个开关。
         self.svc_cards = {}
         for key, title, desc in (
-            ("qq", "QQ 登录", "没通的话，消息收不到也发不出去"),
-            ("bot", "对话服务", "负责跟你说话、派活的那个"),
-            ("bridge", "任务端", "真正在电脑上干活的那个"),
+            ("qq", "QQ 通道", "要拉 QQ 客户端，比较占内存。不用 QQ 就关掉"),
+            ("feishu", "飞书通道", "纯网络连接，很轻，几秒钟就能开"),
+            ("bridge", "任务端", "真正在电脑上干活的那个，跟通道无关"),
         ):
             card = ServiceCard(key, title, desc)
             card.action_clicked.connect(self._svc_action)
             self.svc_cards[key] = card
             lay.addWidget(card)
+
+        # 一行提示：说明为什么拆开
+        hint = QLabel(
+            "只需要一个平台的话，只开那一个就行——另一个不会启动，省内存。"
+        )
+        hint.setFont(font(11))
+        hint.setStyleSheet(f"color:{C_DIM2};")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
 
         lay.addStretch()
         return page
@@ -1416,6 +1508,132 @@ class MainWindow(QMainWindow):
         #    最后才发现就是少了一行 addWidget。
         lay.addWidget(card)
 
+        # ── 安全验证 ──
+        #
+        # 危险操作（删库、回滚、读密钥）要验证码。
+        # 前两次是提醒和警告，第三次才发码到邮箱。
+        #
+        # 为什么用邮箱不用短信：
+        #   短信要服务商、要钱、要备案。邮箱免费、独立、
+        #   而且同样"不在对话里"——这才是关键。
+        scard = QFrame()
+        scard.setObjectName("card")
+        sc = QVBoxLayout(scard)
+        sc.setContentsMargins(20, 18, 20, 18)
+        sc.setSpacing(9)
+
+        sh = QLabel("危险操作验证")
+        sh.setFont(font(13, QFont.DemiBold))
+        sh.setStyleSheet(f"color:{C_TEXT};")
+        sc.addWidget(sh)
+
+        ssub = QLabel(
+            "删库、回滚代码、读密钥这类操作，会发验证码到你邮箱。"
+            "前两次只是提醒和警告，第三次坚持才发码。"
+        )
+        ssub.setFont(font(11))
+        ssub.setStyleSheet(f"color:{C_DIM2};")
+        ssub.setWordWrap(True)
+        sc.addWidget(ssub)
+
+        # 开关
+        srow = QHBoxLayout()
+        srow.setSpacing(10)
+        self.btn_guard = QPushButton("开启")
+        self.btn_guard.setObjectName("ghost")
+        self.btn_guard.setCursor(Qt.PointingHandCursor)
+        self.btn_guard.clicked.connect(self._toggle_guard)
+        srow.addWidget(self.btn_guard)
+        self.lbl_guard_state = QLabel("")
+        self.lbl_guard_state.setFont(font(10.5))
+        self.lbl_guard_state.setStyleSheet(f"color:{C_DIM2};")
+        srow.addWidget(self.lbl_guard_state, 1)
+        sc.addLayout(srow)
+
+        def sfield(label: str, placeholder: str, secret: bool = False):
+            lb = QLabel(label)
+            lb.setFont(font(11))
+            lb.setStyleSheet(f"color:{C_DIM2};")
+            sc.addWidget(lb)
+            ed = QLineEdit()
+            ed.setMinimumHeight(36)
+            ed.setPlaceholderText(placeholder)
+            if secret:
+                ed.setEchoMode(QLineEdit.Password)
+            sc.addWidget(ed)
+            return ed
+
+        self.ed_guard_email = sfield("收验证码的邮箱", "you@example.com")
+
+        # 服务器不让人填——填完邮箱自动认出来。
+        #
+        # 让用户去查"你的邮箱 SMTP 服务器是什么"，是个很烦的门槛：
+        # 大部分人根本不知道这个词，得去搜文档，搜到了还怕填错。
+        # 常见邮箱就那么几家，认一下就完事。
+        lbl_host = QLabel("发信服务器")
+        lbl_host.setFont(font(11))
+        lbl_host.setStyleSheet(f"color:{C_DIM2};")
+        sc.addWidget(lbl_host)
+
+        self.lbl_guard_host = QLabel("填上面的邮箱，自动认")
+        self.lbl_guard_host.setFont(font(11.5))
+        self.lbl_guard_host.setStyleSheet(f"color:{C_DIM2};")
+        self.lbl_guard_host.setMinimumHeight(36)
+        self.lbl_guard_host.setStyleSheet(
+            f"color:{C_DIM2}; padding:8px 13px;"
+            f" background:{C_INPUT}; border:1px solid {C_LINE}; border-radius:9px;"
+        )
+        sc.addWidget(self.lbl_guard_host)
+
+        # 填完邮箱立刻认
+        self.ed_guard_email.textChanged.connect(self._detect_guard_host)
+
+        # 发信账号要单独填。
+        #
+        # 为什么不能默认用收件邮箱：
+        #   收件邮箱是"发到哪"，发信账号是"谁发的"。
+        #   这俩经常不一样——比如你收件用 163，
+        #   但机器人的发信账号是专门注册的一个 QQ 邮箱。
+        self.ed_guard_user = sfield(
+            "前台 Agent 发信账号", "机器人用哪个邮箱发给你"
+        )
+        self.ed_guard_pass = sfield(
+            "前台 Agent 发信授权码", "这个账号的授权码，不是登录密码",
+            secret=True,
+        )
+
+        grow = QHBoxLayout()
+        grow.setSpacing(8)
+        g1 = QPushButton("保存")
+        g1.setObjectName("primary")
+        g1.setCursor(Qt.PointingHandCursor)
+        g1.clicked.connect(self._save_guard)
+        grow.addWidget(g1)
+
+        g2 = QPushButton("发封测试邮件")
+        g2.setObjectName("ghost")
+        g2.setCursor(Qt.PointingHandCursor)
+        g2.clicked.connect(self._test_guard)
+        grow.addWidget(g2)
+
+        self.lbl_guard_msg = QLabel("")
+        self.lbl_guard_msg.setFont(font(10.5))
+        self.lbl_guard_msg.setStyleSheet(f"color:{C_DIM2};")
+        self.lbl_guard_msg.setWordWrap(True)
+        grow.addWidget(self.lbl_guard_msg, 1)
+        sc.addLayout(grow)
+
+        ghint = QLabel(
+            "常见配置：QQ 邮箱 smtp.qq.com｜163 邮箱 smtp.163.com｜"
+            "Gmail smtp.gmail.com"
+        )
+        ghint.setFont(font(10))
+        ghint.setStyleSheet(f"color:{C_DIM2};")
+        ghint.setWordWrap(True)
+        sc.addWidget(ghint)
+
+        lay.addWidget(scard)
+
         # ── 启动行为 ──
         acard = QFrame()
         acard.setObjectName("card")
@@ -1508,6 +1726,154 @@ class MainWindow(QMainWindow):
         page.setWidget(inner)
         return page
 
+    # ── 安全验证 ──
+
+    def _load_guard(self) -> None:
+        """把安全邮箱配置读出来。"""
+
+        def done(data):
+            if not isinstance(data, dict) or not data.get("ok"):
+                return
+            self._guard_on = bool(data.get("enabled"))
+            self.ed_guard_email.setText(data.get("email") or "")
+            self.ed_guard_user.setText(data.get("smtp_user") or "")
+            # 服务器不用填，_detect_guard_host 会跟着邮箱自动更新
+            self.ed_guard_pass.clear()
+
+            if data.get("has_pass"):
+                self.ed_guard_pass.setPlaceholderText("已保存 · 留空表示不改")
+            else:
+                self.ed_guard_pass.setPlaceholderText(
+                    "邮箱设置里那个「授权码」，不是登录密码"
+                )
+
+            self._refresh_guard_ui(bool(data.get("ready")))
+
+        self.api.request_once("/api/guard", callback=done)
+
+    def _refresh_guard_ui(self, ready: bool) -> None:
+        on = getattr(self, "_guard_on", False)
+        self.btn_guard.setText("开启" if not on else "关闭")
+        if not ready:
+            text = "还没配好 · 危险操作目前不验证"
+            color = C_BAD
+        elif on:
+            text = "已开启 · 危险操作要邮箱验证码"
+            color = C_OK
+        else:
+            text = "配置好了，但开关是关的"
+            color = C_WARN
+        self.lbl_guard_state.setText(text)
+        self.lbl_guard_state.setStyleSheet(f"color:{color}; font-size:10.5px;")
+
+    def _toggle_guard(self) -> None:
+        on = not getattr(self, "_guard_on", False)
+        self._guard_on = on
+        self.api.request_once(
+            "/api/guard", {"enabled": on}, callback=lambda _d: self._load_guard()
+        )
+
+    # 常见邮箱的 SMTP 服务器
+    _SMTP = {
+        "qq.com": ("smtp.qq.com", 465),
+        "foxmail.com": ("smtp.qq.com", 465),
+        "163.com": ("smtp.163.com", 465),
+        "126.com": ("smtp.126.com", 465),
+        "yeah.net": ("smtp.yeah.net", 465),
+        "sina.com": ("smtp.sina.com", 465),
+        "sohu.com": ("smtp.sohu.com", 465),
+        "aliyun.com": ("smtp.aliyun.com", 465),
+        "139.com": ("smtp.139.com", 465),
+        "gmail.com": ("smtp.gmail.com", 465),
+        "outlook.com": ("smtp-mail.outlook.com", 587),
+        "hotmail.com": ("smtp-mail.outlook.com", 587),
+        "live.com": ("smtp-mail.outlook.com", 587),
+        "yahoo.com": ("smtp.mail.yahoo.com", 465),
+        "icloud.com": ("smtp.mail.me.com", 587),
+    }
+
+    def _detect_guard_host(self, text: str) -> None:
+        """填邮箱时自动显示会用的发信服务器。"""
+        text = (text or "").strip().lower()
+        if "@" not in text:
+            self.lbl_guard_host.setText("填上面的邮箱，自动认")
+            self.lbl_guard_host.setStyleSheet(
+                f"color:{C_DIM2}; padding:8px 13px;"
+                f" background:{C_INPUT}; border:1px solid {C_LINE};"
+                f" border-radius:9px;"
+            )
+            self._guard_host_value = ("", 0)
+            return
+
+        domain = text.rsplit("@", 1)[1]
+        host, port = self._SMTP.get(domain, ("", 0))
+
+        if host:
+            self.lbl_guard_host.setText(f"{host}  端口 {port}   ← 自动识别")
+            self.lbl_guard_host.setStyleSheet(
+                f"color:{C_OK}; padding:8px 13px;"
+                f" background:{C_INPUT}; border:1px solid {C_LINE};"
+                f" border-radius:9px;"
+            )
+            self._guard_host_value = (host, port)
+        else:
+            self.lbl_guard_host.setText(
+                f"认不出 {domain} 的服务器，你可以先保存试试"
+            )
+            self.lbl_guard_host.setStyleSheet(
+                f"color:{C_WARN}; padding:8px 13px;"
+                f" background:{C_INPUT}; border:1px solid {C_LINE};"
+                f" border-radius:9px;"
+            )
+            self._guard_host_value = ("", 0)
+
+    def _save_guard(self) -> None:
+        host, port = getattr(self, "_guard_host_value", ("", 0))
+        body = {
+            "email": self.ed_guard_email.text().strip(),
+            "smtp_host": host,
+            "smtp_port": port,
+            "smtp_user": self.ed_guard_user.text().strip(),
+            "smtp_pass": self.ed_guard_pass.text().strip(),
+            "enabled": True,
+        }
+        if not body["email"]:
+            self.lbl_guard_msg.setText("收验证码的邮箱得填")
+            return
+        if not host:
+            self.lbl_guard_msg.setText(
+                "认不出这个邮箱的发信服务器，换一个常见邮箱试试（QQ / 163 / Gmail）"
+            )
+            return
+        if not body["smtp_user"]:
+            self.lbl_guard_msg.setText("前台 Agent 发信账号得填")
+            return
+
+        def done(data):
+            if isinstance(data, dict) and data.get("ok"):
+                self.lbl_guard_msg.setText("已保存")
+                self._guard_on = True
+                self._load_guard()
+            else:
+                self.lbl_guard_msg.setText("保存失败")
+
+        self.lbl_guard_msg.setText("保存中…")
+        self.api.request_once("/api/guard", body, callback=done)
+
+    def _test_guard(self) -> None:
+        def done(data):
+            if isinstance(data, dict) and data.get("ok"):
+                self.lbl_guard_msg.setText(data.get("message") or "发出去了")
+            else:
+                self.lbl_guard_msg.setText(
+                    (data or {}).get("message")
+                    or (data or {}).get("error")
+                    or "发不出去"
+                )
+
+        self.lbl_guard_msg.setText("发测试邮件…")
+        self.api.request_once("/api/guard/test", {}, timeout=40, callback=done)
+
     # ── 行为 ──
     def refresh(self) -> None:
         self.api.get("/api/tasks")
@@ -1526,10 +1892,21 @@ class MainWindow(QMainWindow):
 
         每个组件自己判断"有没有变"，没变就不重绘。
         这一层不额外做判断——状态逻辑放组件里，别两处都管。
+
+        ⚠️ 只处理**真的返回了的字段**。
+            原来写 bool(d.get(k))，字段缺失时 .get 返回 None，
+            bool(None) 是 False——于是"这次没问到"被当成了"这个关了"。
+
+            现在的规则：这个键不在返回里，说明这次没问到它，
+            保留上一次的显示，什么都别动。
         """
         for k, dot in self.pills.items():
+            if k not in d:
+                continue
             dot.set_color(C_OK if d.get(k) else C_BAD)
         for k, card in self.svc_cards.items():
+            if k not in d:
+                continue
             card.set_ok(bool(d.get(k)))
 
     def _on_api(self, path: str, data) -> None:
@@ -1671,12 +2048,16 @@ class MainWindow(QMainWindow):
                 · QQ 要扫码等一分钟，界面照样能动
                 · 状态一真起来，按钮自己和二维码窗口自己收尾
         """
-        names = {"qq": "QQ", "bot": "对话服务", "bridge": "任务端"}
+        names = {"qq": "QQ 通道", "feishu": "飞书通道", "bridge": "任务端"}
         verb = "启动" if action == "start" else "重启"
 
         card = self.svc_cards.get(key)
         if card:
             card.mark_working()
+
+        # 飞书通道不需要扫码，直接走。
+        # 它比 QQ 轻得多：宿主起来了、把这条连接打开就行，几秒钟的事。
+        # 所以不走下面那套"等扫码"的流程。
 
         # QQ 起的时候把扫码头摆出来。
         # 它自己会判断：一旦发现 QQ 通了就关掉自己，
@@ -1709,9 +2090,13 @@ class MainWindow(QMainWindow):
             if card:
                 card.clear_working()
 
-        # 超时给够：启动 QQ 可能要等扫码
+        # 超时分开给：
+        #   QQ   → 要等扫码，给足 200 秒
+        #   飞书 → 只是连个网络，120 秒足够（含 AstrBot 冷启动）
+        #   任务端 → 立刻就回
+        timeout = {"qq": 200, "feishu": 150, "bridge": 30}.get(key, 120)
         self.api.request_once(path, {"target": key},
-                              timeout=200, callback=done)
+                              timeout=timeout, callback=done)
 
     def _detect_paths(self) -> None:
         """重新探测一遍路径，把结果填进输入框。

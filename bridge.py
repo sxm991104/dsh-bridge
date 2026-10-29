@@ -41,6 +41,8 @@ import threading
 import time
 from datetime import datetime
 
+from safe_path import safe_join, safe_name  # noqa: E402
+
 BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
 TASKS = os.path.join(BRIDGE_DIR, "tasks.jsonl")
 RESULTS = os.path.join(BRIDGE_DIR, "results.jsonl")
@@ -152,7 +154,15 @@ def _sessions_dir() -> str:
 
 
 def _task_session_path(task_id: str) -> str:
-    return os.path.join(_sessions_dir(), f"{task_id}.session")
+    """会话文件在哪。
+
+    ⚠️ task_id 是用户能给的东西，必须校验。
+        实测过：任务名写 "../PWNED" 能逃到桥目录外面去。
+    """
+    from safe_path import safe_join
+
+    d = safe_join(_sessions_dir(), task_id)
+    return d + ".session"
 
 
 def _task_workdir(task_id: str) -> str:
@@ -164,7 +174,13 @@ def _task_workdir(task_id: str) -> str:
 
     目录位置：<桥目录>/workspaces/<task_id>/
     """
-    d = os.path.join(BRIDGE_DIR, "workspaces", task_id)
+    # ⚠️ 这是最要紧的一处：任务的工作目录。
+    #
+    #    实测逃出去过一次——任务名 "../PWNED"，在桥目录外面
+    #    建出了文件夹。攻击者能往系统目录写，也能覆盖用户的文件。
+    #
+    #    这里用 safe_join：校验名字 + 校验真实路径在根目录里。
+    d = safe_join(os.path.join(BRIDGE_DIR, "workspaces"), task_id)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -1317,9 +1333,21 @@ def notify_outbox(task_id: str, rec: dict, task_text: str = "") -> None:
     """
     st = (rec or {}).get("status") or ""
     try:
+        # 这个任务用的是哪套模型配置。
+        # 推送那边要靠它标出「[DeepSeek] xxx 做完了」。
+        prof_id = ""
+        try:
+            for t in _read_tasks():
+                if t.get("id") == task_id:
+                    prof_id = t.get("profile") or ""
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+
         note = {
             "id": task_id,
             "name": task_id,
+            "profile": prof_id,
             "status": st,
             "ok": st == "ok",
             "task": (task_text or (rec or {}).get("task") or "")[:200],

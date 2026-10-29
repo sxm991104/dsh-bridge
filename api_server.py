@@ -146,11 +146,43 @@ def _listening_pids(port: int) -> list[str]:
 
 
 def https_status() -> dict:
+    """三个开关各自的状态。
+
+    QQ 和飞书看的是"这条通道真的连上没有"，不是"进程在不在"。
+    进程起着但连接断了，用户一样用不了，就该显示成关的。
+
+    任务端没有常驻进程，永远是通的——它每次派活才起。
+    """
+    qq_ok = False
+    fs_ok = False
+    try:
+        from desktop import channels as _ch
+
+        d = _ch.status()
+        if d.get("ok"):
+            for p in d.get("platforms") or []:
+                if p.get("type") == "aiocqhttp":
+                    qq_ok = bool(p.get("connected"))
+                elif p.get("type") == "lark":
+                    fs_ok = bool(p.get("connected"))
+        else:
+            # 启停接口还没起来（AstrBot 刚启动或者没起），
+            # 退回看端口——至少能反映"宿主开着没有"
+            qq_ok = _port_ok(_NAPCAT_PORT) and _port_ok(_BOT_PORT)
+            fs_ok = _port_ok(_BOT_PORT)
+    except Exception:  # noqa: BLE001
+        qq_ok = _port_ok(_NAPCAT_PORT)
+        fs_ok = _port_ok(_BOT_PORT)
+
     return {
-        "qq": _port_ok(_NAPCAT_PORT),
-        "bot": _port_ok(_BOT_PORT),
-        "bridge": bool(bridge._resolve_dsh()) if hasattr(bridge, "_resolve_dsh") else True,
+        "qq": qq_ok,
+        "feishu": fs_ok,
+        "bridge": True,
     }
+
+
+# 本机接口的访问 token。main() 启动时生成/读取，_guard() 用它校验。
+_API_TOKEN = ""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -166,9 +198,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        # 面板是本地页面，允许跨源
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        # ⚠️ 这里原来是 Access-Control-Allow-Origin: "*"。
+        #
+        #    通配符的意思是"任何网站都可以跨源读我的响应"。
+        #    这个接口能派活、能读任务内容，不该让随便哪个网页读。
+        #
+        #    改成只回显本机来源。面板页面由同一个服务发出（同源），
+        #    本来就不需要 CORS；留一个本机来源是给调试用的。
+        origin = self.headers.get("Origin", "")
+        if origin.startswith(("http://127.0.0.1", "http://localhost")):
+            self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Token")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
         try:
@@ -179,19 +219,137 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):  # noqa: N802
         self._send(204, b"")
 
+    def _guard(self) -> bool:
+        """三层防护，过不了就直接回绝。
+
+        第一层  地址必须是本机（绑了 127.0.0.1，这里是第二道确认）
+        第二层  带浏览器 Origin 头的拒绝（防恶意网页偷调）
+        第三层  token 必须对
+
+        为什么 token 放最后检查：
+            前面两层是便宜的判断，token 要读文件、比字符串。
+            先便宜的、后贵的。
+
+        例外：/api/health 不需要 token。
+            它是给"服务活没活着"用的，不碰任何数据，
+            桌面端和启动器都要在拿 token 之前问它。
+        """
+        import security as _sec
+
+        # 第一层：只接受本机连接
+        if not _sec.is_local_address(self.client_address[0]):
+            self._send(403, b'{"error":"only local connections"}')
+            return False
+
+        # DNS rebinding 检查：Host 头必须是本机名。
+        #
+        # 攻击者把 evil.com 的 DNS 指到 127.0.0.1，
+        # 用户打开 evil.com 时，请求会打到我们这里，
+        # 但 Host 头是 evil.com。这种请求直接拒。
+        if not _sec.host_is_local(self.headers):
+            self._send(403, b'{"error":"bad host"}')
+            return False
+
+        # 第二层：浏览器一律拒绝。
+        #
+        # 这条挡的是：用户打开了一个恶意网页，那个网页
+        # 往 localhost:8790 POST 一个任务。浏览器能发出去
+        # （跨源只拦读响应，不拦发请求），而派活不需要读响应。
+        if _sec.has_browser_origin(self.headers):
+            self._send(403, b'{"error":"browser requests not allowed"}')
+            return False
+
+        # 第三层：token
+        if getattr(self, "path", "") in ("/api/health",):
+            return True
+
+        # 恒定时间比较 + 空 token 一律拒。
+        #
+        # ⚠️ 原来写的是 `if want and got != want`——
+        #    want 为空时整句短路成 False，等于**放行所有人**。
+        #    token 生成失败（文件写不进去）的时候就是这个状态。
+        #    现在 token_matches 明确处理了空的情况。
+        got = self.headers.get("X-Token", "")
+        if not _sec.token_matches(got, _API_TOKEN):
+            self._send(401, b'{"error":"bad or missing X-Token"}')
+            return False
+
+        return True
+
+    # 请求体最大多少。
+    #
+    # 实测过：不限制的话，一个 2MB 的 task 字段会被原样接受，
+    # 然后喂给模型——那个任务的 token 费用能烧掉一大笔钱。
+    # 而且超大请求体本身也是种资源消耗。
+    #
+    # 1MB 足够用了：最长的任务描述也就几万字。
+    MAX_BODY = 1024 * 1024
+
+    @staticmethod
+    def _str_field(body: dict, key: str, default: str = "") -> str:
+        """从请求体里取一个字符串字段。
+
+        ⚠️ 为什么不能直接用 body.get(key)：
+            攻击者传 {"task": 123} 时，拿到的是 int，
+            后面调 .strip() 就崩，连接断掉。
+            {"name": [1,2]} 同理。
+            这类崩溃不算能利用，但是拒绝服务——请求不是干净地
+            回 400，而是把连接弄断。
+
+        非字符串一律当没给（走下面的"必填"检查回 400）。
+        """
+        v = body.get(key)
+        if not isinstance(v, str):
+            return default
+        return v
+
     def _body(self) -> dict:
+        """读请求体。
+
+        ⚠️ 必须校验解析出来的类型。
+            原来直接 json.loads 就往回返，于是：
+                body = null   → None，后面 body.get() 崩
+                body = []     → list，同样崩
+                body = 123    → int，崩
+            这些请求会让连接直接断掉（不是干净地回错误码）。
+            攻击者拿这个就能做拒绝服务。
+        """
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            if n <= 0:
-                return {}
-            raw = self.rfile.read(n)
-            return json.loads(raw.decode("utf-8"))
-        except Exception:  # noqa: BLE001
+        except (TypeError, ValueError):
+            n = 0
+
+        if n <= 0:
             return {}
+
+        if n > self.MAX_BODY:
+            # 不读、直接拒。读了就白消耗内存。
+            self._send(413, b'{"error":"request body too large"}')
+            return None
+
+        try:
+            raw = self.rfile.read(n)
+        except OSError:
+            return {}
+
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send(400, b'{"error":"bad json"}')
+            return None
+
+        # 必须是对象（dict）。数组、字符串、数字、null 一律不当请求体。
+        if not isinstance(data, dict):
+            self._send(400, b'{"error":"body must be a json object"}')
+            return None
+
+        return data
 
     # ── 路由 ──
 
     def do_GET(self):  # noqa: N802
+        if not self._guard():
+            return
         path = unquote(urlparse(self.path).path)
 
         # 根路径直接给面板页面。
@@ -234,6 +392,16 @@ class Handler(BaseHTTPRequestHandler):
                 st, b = _json({"error": f"{type(e).__name__}: {e}"}, 500)
             return self._send(st, b)
 
+        if path == "/api/channels":
+            try:
+                from desktop import channels as _ch
+
+                d = _ch.status()
+                st, b = _json(d)
+            except Exception as e:  # noqa: BLE001
+                st, b = _json({"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return self._send(st, b)
+
         if path == "/api/services":
             try:
                 return self._send(*_json(https_status()))
@@ -252,6 +420,25 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/engine/profiles":
             return self._profiles_get()
 
+
+        if path == "/api/guard":
+            try:
+                import guard
+
+                c = guard.load_config()
+                return self._send(*_json({
+                    "ok": True,
+                    "enabled": c.get("enabled"),
+                    "email": c.get("email") or "",
+                    "email_masked": guard._mask_email(c.get("email") or ""),
+                    "smtp_host": c.get("smtp_host") or "",
+                    "smtp_port": c.get("smtp_port") or 465,
+                    "smtp_user": c.get("smtp_user") or "",
+                    "has_pass": bool(c.get("smtp_pass")),
+                    "ready": guard.is_guard_ready(),
+                }))
+            except Exception as e:  # noqa: BLE001
+                return self._send(*_json({"ok": False, "error": str(e)}, 500))
 
         if path == "/api/autostart":
             try:
@@ -279,17 +466,58 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, b'{"error":"not found"}')
 
     def do_POST(self):  # noqa: N802
+        """所有 POST 入口。
+
+        外面包一层兜底：任何没预料到的异常，都回一个 500，
+        而不是让连接直接断掉。
+
+        为什么要这层：
+            实测过 {"task": 123} 这种类型不对的请求能崩到连接断开。
+            那算是拒绝服务——客户端拿不到任何错误码，
+            只能看到"连接被重置"，排查时一脸茫然。
+
+            内部处理函数各自还有 try，这层是最后一道。
+        """
+        try:
+            self._do_post()
+        except Exception as e:  # noqa: BLE001
+            try:
+                self._send(
+                    500,
+                    json.dumps(
+                        {"error": f"{type(e).__name__}"}, ensure_ascii=False
+                    ).encode("utf-8"),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _do_post(self):  # noqa: N802
+        if not self._guard():
+            return
         path = urlparse(self.path).path
         body = self._body()
+        if body is None:
+            # _body 已经回过错误了（413 太大 / 400 不是对象），别再往下走
+            return
 
         if path == "/api/dispatch":
-            task = (body.get("task") or "").strip()
-            name = (body.get("name") or "").strip()
-            profile = (body.get("profile") or "").strip()
+            task = self._str_field(body, "task").strip()
+            name = self._str_field(body, "name").strip()
+            profile = self._str_field(body, "profile").strip()
             if not task:
                 return self._send(400, b'{"error":"task is required"}')
             if not name:
                 return self._send(400, b'{"error":"name is required"}')
+            # 名字先过一遍校验，不合法就直接拒，别让它在后面炸
+            try:
+                from safe_path import safe_name as _sn
+
+                _sn(name)
+            except ValueError as e:
+                return self._send(
+                    400,
+                    json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"),
+                )
             try:
                 st, b = _json(self._dispatch_with_concurrency(task, name, profile))
             except Exception as e:  # noqa: BLE001
@@ -297,8 +525,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(st, b)
 
         if path == "/api/continue":
-            name = (body.get("name") or "").strip()
-            msg = (body.get("message") or "继续").strip()
+            name = self._str_field(body, "name").strip()
+            msg = self._str_field(body, "message", "继续").strip()
             if not name:
                 return self._send(400, b'{"error":"name is required"}')
             try:
@@ -337,6 +565,87 @@ class Handler(BaseHTTPRequestHandler):
                 st, b = _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
             return self._send(st, b)
 
+        if path == "/api/guard":
+            try:
+                return self._send(*_json(self._guard_set(body)))
+            except Exception as e:  # noqa: BLE001
+                return self._send(*_json({"ok": False, "error": str(e)}, 500))
+
+        if path == "/api/guard/test":
+            try:
+                import guard
+
+                ok, msg = guard.send_code_email(
+                    "这是一封测试邮件，不需要做任何事",
+                    purpose="测试安全邮箱能不能收到",
+                )
+                return self._send(*_json({"ok": ok, "message": msg}))
+            except Exception as e:  # noqa: BLE001
+                return self._send(*_json({"ok": False, "error": str(e)}, 500))
+
+        if path == "/api/guard/code":
+            try:
+                import guard
+
+                task = self._str_field(body, "task")
+                purpose = self._str_field(body, "purpose")
+                if not task:
+                    return self._send(400, b'{"ok":false,"error":"task is required"}')
+                if not guard.is_guard_ready():
+                    return self._send(*_json({
+                        "ok": False,
+                        "message": "安全邮箱没配好。让用户去桌面端 设置 → 危险操作验证 里填。",
+                    }))
+                ok, msg = guard.send_code_email(task, purpose=purpose)
+                return self._send(*_json({"ok": ok, "message": msg}, 200 if ok else 400))
+            except Exception as e:  # noqa: BLE001
+                return self._send(*_json({"ok": False, "error": str(e)}, 500))
+
+        if path == "/api/guard/check":
+            try:
+                import guard
+
+                task = self._str_field(body, "task")
+                if not task:
+                    return self._send(400, b'{"ok":false,"error":"task is required"}')
+                r = guard.check(task)
+                return self._send(*_json({"ok": True, **r}))
+            except Exception as e:  # noqa: BLE001
+                return self._send(*_json({"ok": False, "error": str(e)}, 500))
+
+        if path == "/api/guard/selftest":
+            # 自检接口：在服务进程内跑一遍 guard 的完整状态机。
+            #
+            # 为什么需要它：
+            #    guard 的状态在**服务进程的内存里**。
+            #    测试脚本 import 的是另一份，两边内存不通——
+            #    实测过好几次"测试说没锁、服务说锁着"，
+            #    就是两份状态在打架。
+            #
+            #    这个接口让测试跑在**服务自己的那份状态里**，
+            #    测完自己清理干净。
+            #
+            # 安全：
+            #   · 需要 token（跟其他接口一样）
+            #   · 只在本机
+            #   · 只做自检，不接受"把某个任务设成已通过"这种参数
+            #     （那才是真后门）
+            try:
+                return self._send(*_json(self._guard_selftest()))
+            except Exception as e:  # noqa: BLE001
+                return self._send(*_json({"ok": False, "error": str(e)}, 500))
+
+        if path == "/api/guard/verify":
+            try:
+                import guard
+
+                task = self._str_field(body, "task")
+                code = self._str_field(body, "code")
+                ok, msg = guard.verify(task, code)
+                return self._send(*_json({"ok": ok, "message": msg}))
+            except Exception as e:  # noqa: BLE001
+                return self._send(*_json({"ok": False, "error": str(e)}, 500))
+
         if path == "/api/autostart":
             try:
                 import paths
@@ -358,7 +667,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(st, b)
 
         if path == "/api/start":
-            target = (body.get("target") or "").strip()
+            target = self._str_field(body, "target").strip()
             try:
                 st, b = _json(self._start(target))
             except Exception as e:  # noqa: BLE001
@@ -716,6 +1025,167 @@ class Handler(BaseHTTPRequestHandler):
         ok, msg = test_connection(base, key, model)
         return {"ok": ok, "message": msg}
 
+    def _guard_set(self, body: dict) -> dict:
+        """保存安全邮箱配置。
+
+        ⚠️ 授权码不回传。
+            传空表示"不改"——用户不想为了改个邮箱把授权码重打一遍。
+        """
+        import guard
+
+        cur = guard.load_config()
+        for k in ("email", "smtp_host", "smtp_user"):
+            v = self._str_field(body, k)
+            if v:
+                cur[k] = v.strip()
+
+        port = body.get("smtp_port")
+        if isinstance(port, (int, str)) and str(port).strip():
+            try:
+                cur["smtp_port"] = int(port)
+            except (TypeError, ValueError):
+                pass
+
+        # 授权码：空 = 不改
+        pw = self._str_field(body, "smtp_pass")
+        if pw and pw.strip():
+            cur["smtp_pass"] = pw.strip()
+
+        cur["enabled"] = bool(body.get("enabled", True))
+        guard.save_config(cur)
+
+        return {
+            "ok": True,
+            "ready": guard.is_guard_ready(),
+            "email_masked": guard._mask_email(cur.get("email") or ""),
+        }
+
+    def _guard_selftest(self) -> dict:
+        """在服务进程里跑一遍 guard 的完整状态机。
+
+        为什么在这里跑而不是在外面跑：
+            guard 的状态在进程内存里。测试脚本 import 的是另一份，
+            两边不通——实测过好几次"测试说没锁、服务说锁着"。
+
+            这个函数跑在服务自己的进程里，用的是同一份状态。
+
+        会做什么：
+            塞临时的 pending / 锁，验证状态机对不对，然后清干净。
+            **不会发真邮件**（`send_code_email` 会发信，这里绕开它，
+            直接构造 PendingCode）。
+
+        清理是 finally 保证的——即使断言中途抛了，也会清干净。
+        这一点很要紧：围栏没清的话，后面所有派活都会被挡，
+        用户会以为程序坏了。
+        """
+        import time as _t
+
+        import guard
+
+        results = []
+
+        def ck(desc: str, got, want) -> None:
+            ok = (got in want) if isinstance(want, (tuple, list)) else (got == want)
+            results.append({"desc": desc, "ok": ok, "got": got, "want": want})
+
+        def reset() -> None:
+            guard._state.pending.clear()
+            guard._state.locked_until.clear()
+            guard._state.fails.clear()
+            guard._locked.clear()
+            guard._force_locked.clear()
+            guard._verified.clear()
+
+        try:
+            reset()
+
+            # ── A. 平时 ──
+            r = guard.check("把按钮改大")
+            ck("平时 fenced=False", r["fenced"], False)
+            ck("平时可以派", r["verified"], True)
+
+            # ── B. 发码 → 全站锁 ──
+            danger = "__selftest__ 删掉用户表"
+            fp = guard._fingerprint(danger)
+            guard._state.pending[fp] = guard.PendingCode(
+                code="123456", task=danger, purpose="", expires=_t.time() + 120
+            )
+            r = guard.check(danger)
+            ck("危险任务被锁", r["fenced"], True)
+            ck("在等用户填", r["waiting"], True)
+            ck("可以重发码", r["can_resend"], True)
+
+            r = guard.check("把按钮改大")
+            ck("★ 普通任务也被锁", r["fenced"], True)
+
+            # ── C. 验证通过 → 解锁 ──
+            ok, _ = guard.verify(danger, "123456")
+            ck("验证通过", ok, True)
+            r = guard.check(danger)
+            ck("危险任务解锁", r["fenced"], False)
+            r = guard.check("把按钮改大")
+            ck("★ 普通任务解锁", r["fenced"], False)
+
+            # 一次性
+            ok2, _ = guard.verify(danger, "123456")
+            ck("验证码不能复用", ok2, False)
+
+            # ── D. 过期 → 锁 10 分钟 ──
+            reset()
+            guard._state.pending[fp] = guard.PendingCode(
+                code="111111", task=danger, purpose="", expires=_t.time() - 1
+            )
+            r = guard.check(danger)
+            ck("过期后仍锁", r["fenced"], True)
+            ck("锁约 600 秒", 580 < r["lock_left"] <= 600, True)
+            ck("普通过期可以重发", r["can_resend"], True)
+
+            # ── E. 错三次 → 强制锁 ──
+            reset()
+            guard._state.pending[fp] = guard.PendingCode(
+                code="222222", task=danger, purpose="", expires=_t.time() + 120
+            )
+            o1, m1 = guard.verify(danger, "000000")
+            o2, m2 = guard.verify(danger, "000000")
+            o3, m3 = guard.verify(danger, "000000")
+            ck("第1次错被拒", o1, False)
+            ck("提示还剩2次", "2" in m1, True)
+            ck("第2次错被拒", o2, False)
+            ck("提示还剩1次", "1" in m2, True)
+            ck("第3次错被拒", o3, False)
+
+            r = guard.check(danger)
+            ck("错三次后强制锁", r["forced"], True)
+            ck("强制锁不许重发", r["can_resend"], False)
+
+            ok4, msg4 = guard.send_code_email(danger, "")
+            ck("强制锁期间重发被拒", ok4, False)
+
+            r = guard.check("普通任务")
+            ck("强制锁期间普通任务也锁", r["fenced"], True)
+
+            # ── F. 锁满 → 自动解 ──
+            for k in list(guard._force_locked.keys()):
+                guard._force_locked[k] = _t.time() - 1
+            for k in list(guard._locked.keys()):
+                guard._locked[k] = _t.time() - 1
+            guard._state.locked_until.clear()
+            r = guard.check("普通任务")
+            ck("锁满自动解", r["fenced"], False)
+            ck("可以重发码了", r["can_resend"], True)
+
+        finally:
+            # 不管上面成没成，都清干净
+            reset()
+
+        passed = sum(1 for x in results if x["ok"])
+        return {
+            "ok": passed == len(results),
+            "passed": passed,
+            "failed": len(results) - passed,
+            "results": results,
+        }
+
     def _paths_get(self):
         """把路径配置交给设置页。
 
@@ -847,6 +1317,68 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             return self._send(*_json({"error": f"{type(e).__name__}: {e}"}, 500))
 
+    def _ensure_host(self) -> dict:
+        """确保宿主（AstrBot）在跑。两条通道都要它。"""
+        if port_open(ASTRBOT_PORT, timeout=1):
+            return {"ok": True}
+
+        if _launcher is None:
+            return {"ok": False, "error": "启动模块没加载上"}
+
+        ok, msg = _launcher.start_bot()
+        if not ok:
+            return {"ok": False, "error": msg}
+
+        import time as _t
+
+        for _ in range(100):
+            _t.sleep(1)
+            if port_open(ASTRBOT_PORT, timeout=0.5):
+                # 端口通了还不够，插件的启停接口也要就绪
+                try:
+                    from desktop import channels as _ch
+
+                    _ch.wait_ready(timeout=60)
+                except Exception:  # noqa: BLE001
+                    pass
+                return {"ok": True}
+
+        return {"ok": False, "error": "对话服务没起来，可能启动报错了。"}
+
+    def _set_channel(self, platform_id: str, on: bool) -> dict:
+        """在 AstrBot 里打开或关掉一条通道（热操作，不重启）。"""
+        try:
+            from desktop import channels as _ch
+
+            if on:
+                return _ch.enable(platform_id)
+            return _ch.disable(platform_id)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    def _ensure_channel(self, platform_id: str) -> dict:
+        """确保某条通道是开着的。"""
+        r = self._set_channel(platform_id, True)
+        return r
+
+    def _start_feishu(self) -> dict:
+        """只开飞书：起宿主 + 关掉 QQ 平台。"""
+        host = self._ensure_host()
+        if not host.get("ok"):
+            return host
+
+        # 打开飞书
+        r = self._set_channel("feishu", True)
+        if not r.get("ok"):
+            return {"ok": False, "error": f"打开飞书通道失败：{r.get('error')}"}
+
+        # 顺手把 QQ 平台关掉——用户点的是"只开飞书"。
+        # 注意只关连接，不杀 QQ 客户端：
+        # 那是用户自己的 QQ，随便杀会让他正在用的微信/QQ 全断。
+        self._set_channel("qq-napcat", False)
+
+        return {"ok": True, "note": "飞书通道开了（没带 QQ，省内存）。"}
+
     def _start(self, target: str) -> dict:
         """启动一个服务。全程不弹任何窗口。
 
@@ -888,6 +1420,8 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 return {"ok": False, "error": msg}
             if port_open(QQ_PORT, timeout=1):
+                # NapCat 通了，再把 AstrBot 里这条连接打开
+                self._ensure_channel("qq-napcat")
                 return {"ok": True, "note": "QQ 已经起来了。"}
             # 等最多 90 秒
             import time as _t
@@ -895,24 +1429,33 @@ class Handler(BaseHTTPRequestHandler):
             for _ in range(90):
                 _t.sleep(1)
                 if port_open(QQ_PORT, timeout=0.5):
+                    # 起来了，把通道打开、飞书关掉
+                    self._ensure_host()
+                    self._set_channel("qq-napcat", True)
+                    self._set_channel("feishu", False)
                     return {"ok": True, "note": "QQ 起来了，NapCat 也接上了。"}
+            # 要扫码 —— 但通道的事也得处理完。
+            # 踩过：这里提前 return，飞书那条没关掉，
+            # 用户点了「启动 QQ」，结果两个都开着。
+            self._ensure_host()
+            self._set_channel("qq-napcat", True)
+            self._set_channel("feishu", False)
             return {
                 "ok": True,
                 "need_login": True,
                 "note": "QQ 起来了，但还要扫码登录。",
             }
 
-        if target == "bot":
-            ok, msg = _launcher.start_bot()
-            if not ok:
-                return {"ok": False, "error": msg}
-            import time as _t
+        if target == "feishu":
+            # 飞书通道很轻：只需要宿主在跑，然后把这条连接打开。
+            #
+            # 跟原来不同的是：不再顺带把 QQ 也拉起来。
+            # 只用飞书的人不该背着 QQ 客户端那几百兆。
+            return self._start_feishu()
 
-            for _ in range(90):
-                _t.sleep(1)
-                if port_open(ASTRBOT_PORT, timeout=0.5):
-                    return {"ok": True, "note": "对话服务起来了。"}
-            return {"ok": False, "error": "对话服务没起来，可能启动报错了。"}
+        if target == "bot":
+            # 老接口名留着，转给 feishu
+            return self._start_feishu()
 
         if target == "bridge":
             return {"ok": True, "note": "任务端不用单独启动，派活时自己会起。"}
@@ -1076,10 +1619,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
+    global _API_TOKEN
+
+    import security as _sec
+
     ap = argparse.ArgumentParser(description="桥的 HTTP 接口")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
-    ap.add_argument("--host", default="127.0.0.1")
+    # ⚠️ 没有 --host 参数了。
+    #
+    #    原来可以传 --host 0.0.0.0 把接口开给整个局域网，
+    #    等于把"能派活、能读写文件、能跑命令"的手伸到网上。
+    #    这个程序是给本机用的，地址写死。
     args = ap.parse_args()
+
+    _API_TOKEN = _sec.load_or_create_token("dsh-bridge")
 
     # 起一个后台线程，定期把排队中的任务拉起来。
     #
@@ -1094,8 +1647,10 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         print(f"[api] 排队轮转没起来：{e}")
 
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"[api] 桥接口已启动：http://{args.host}:{args.port}")
+    srv = ThreadingHTTPServer((_sec.HOST, args.port), Handler)
+    print(f"[api] 桥接口已启动：http://{_sec.HOST}:{args.port}")
+    print(f"[api] 只接受本机连接，请求需带 X-Token")
+    print(f"[api] token 在：{_sec.token_path('dsh-bridge')}")
     print(f"[api] 任务目录：{BRIDGE_DIR}")
     try:
         srv.serve_forever()

@@ -43,6 +43,39 @@ from PySide6.QtWidgets import (
 
 API = "http://127.0.0.1:8790"
 
+
+def _token() -> str:
+    """读接口的访问 token。
+
+    ⚠️ 这里漏过一次，后果很难查：
+        加 token 鉴权之后，这个模块还在用裸 urlopen 请求，
+        每次都是 401 → 抛异常 → 走到 except 里 emit({"api": False})。
+        界面拿到的是"什么都没开"，按钮全红。
+
+        更难受的是它偶尔能见到真状态——因为别的地方（desktop_qt 的
+        Api 类）是带 token 的，两条路同时往界面送数据，
+        一个说"全红"一个说"飞书开着"，看起来就是按钮在闪。
+
+    每次现读文件，不缓存：文件和接口服务谁先起来不一定。
+    """
+    import os
+
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    p = os.path.join(base, "dsh-bridge", "api_token.txt")
+    try:
+        if os.path.exists(p):
+            return open(p, encoding="utf-8").read().strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _get(path: str, timeout: int = 4):
+    """带 token 的 GET。失败返回 None。"""
+    req = urllib.request.Request(API + path, headers={"X-Token": _token()})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
 # 和 desktop_qt 保持一致
 C_TEXT = "#2b2a28"
 C_DIM = "#7d7a75"
@@ -125,12 +158,33 @@ class ServiceMonitor(QObject):
         threading.Thread(target=self._fetch, daemon=True).start()
 
     def _fetch(self) -> None:
+        """问一次状态。
+
+        ⚠️ 失败时**什么都不要发**。
+            原来失败会 emit({"api": False})，那个 dict 里
+            没有 qq / feishu / bridge 三个键，界面拿到 None，
+            把所有按钮判成"没开"——全变红。
+
+            于是出现了"按钮一直闪"：
+                这一轮请求成功 → 显示真实状态
+                下一轮请求失败 → 全部变红
+                再下一轮又成功 → 又变回来
+
+            查这个问题时，后端 20 秒里一次都没变过，
+            但界面一直在闪——因为闪的是"请求的成功失败"，
+            不是服务状态。
+
+            正确做法：拿不到就别说话。界面保留上一次的已知状态，
+            比显示一个假的"全关"好得多。
+        """
         try:
-            with urllib.request.urlopen(API + "/api/services", timeout=4) as r:
-                d = json.loads(r.read())
-            self.changed.emit(d if isinstance(d, dict) else {})
+            d = _get("/api/services", timeout=4)
         except Exception:  # noqa: BLE001
-            self.changed.emit({"api": False})
+            # 静默。不发任何状态更新。
+            return
+
+        if isinstance(d, dict) and d:
+            self.changed.emit(d)
 
 
 # ----------------------------------------------------------------------
@@ -223,8 +277,7 @@ class LoginQRDialog(QDialog):
     def _fetch(self) -> None:
         # 先看登录没登录
         try:
-            with urllib.request.urlopen(API + "/api/services", timeout=4) as r:
-                d = json.loads(r.read())
+            d = _get("/api/services", timeout=4)
             if isinstance(d, dict) and d.get("qq"):
                 self.logged_in.emit()
                 return
@@ -233,8 +286,7 @@ class LoginQRDialog(QDialog):
 
         # 没登录就去拿二维码
         try:
-            with urllib.request.urlopen(API + "/api/qrcode", timeout=6) as r:
-                q = json.loads(r.read())
+            q = _get("/api/qrcode", timeout=6)
         except Exception as e:  # noqa: BLE001
             self.got_qr.emit({"ok": False, "error": f"取不到二维码：{type(e).__name__}"})
             return

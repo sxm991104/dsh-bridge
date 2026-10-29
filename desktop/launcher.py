@@ -307,3 +307,84 @@ class Launcher:
             except Exception:  # noqa: BLE001
                 pass
         return True, "对话服务已经关掉。"
+
+
+    # ── 按通道启停 ────────────────────────────────────────
+    #
+    # 有了这几个方法，桌面端就能：
+    #     只开飞书 → 起 AstrBot + 关掉 QQ 平台（不带 QQ 客户端）
+    #     只开 QQ  → 起 AstrBot + 拉 QQ 客户端 + 关掉飞书平台
+    #     全开     → 两个都开
+    #
+    # 背景：原来点一次「启动」，QQ 和飞书一起起来。
+    # 只用飞书的人白背着 QQ 客户端那几百兆，低配机直接卡。
+
+    def start_channel(self, which: str) -> None:
+        """启动一条通道。which 是 "qq" 或 "feishu"。
+
+        AstrBot 是宿主，两条通道都要它。所以这里先确保它在跑。
+        """
+        from . import channels as ch
+
+        self.last_error = ""
+
+        # 1) 宿主
+        if not self.bot_running():
+            self.start_bot()
+            # 等它的启停接口就绪
+            ch.wait_ready(timeout=150)
+
+        # 2) QQ 通道还要额外把客户端拉起来
+        if which == "qq":
+            if not self.qq_running():
+                self.start_qq()
+                self._watch_until_qq_ready()
+
+        # 3) 在 AstrBot 里把这条通道打开
+        pid = "qq-napcat" if which == "qq" else "feishu"
+        r = ch.enable(pid)
+        if not r.get("ok"):
+            self.last_error = f"打开 {which} 通道失败：{r.get('error')}"
+
+        # 4) 顺手把另一条关掉——用户点的是「只开这个」
+        other = "feishu" if which == "qq" else "qq-napcat"
+        ch.disable(other)
+
+    def stop_channel(self, which: str) -> None:
+        """关掉一条通道。
+
+        QQ 关了之后连客户端一起停——不然内存还是占着。
+        飞书只断连接，不需要额外动作。
+        """
+        from . import channels as ch
+
+        pid = "qq-napcat" if which == "qq" else "feishu"
+        ch.disable(pid)
+
+        if which == "qq":
+            # 客户端留着它也没用，一起停
+            if self.qq_running():
+                self.stop_qq()
+
+    def _watch_until_qq_ready(self, timeout: float = 120.0) -> None:
+        """等 NapCat 的 3000 端口起来。"""
+        import time
+
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.port_open(3000):
+                return
+            time.sleep(1.5)
+
+    def channels_status(self) -> dict:
+        """两条通道现在的状态，给界面显示。"""
+        from . import channels as ch
+
+        return ch.status()
+
+    def set_channel(self, which: str, on: bool) -> None:
+        """开或关一条通道。which 是 "qq" / "feishu"。"""
+        if on:
+            self.start_channel(which)
+        else:
+            self.stop_channel(which)
