@@ -154,12 +154,67 @@ def main() -> int:
         for line in (r.stdout or "").splitlines():
             if "合计" in line:
                 print(f"  {line.strip()}")
-        # 声明"不同意"的那几条，不当作失败
+
+        # ⚠️ 这里原来只打印，不计数 —— 是假绿。
+        #
+        #    有人指出来的问题：
+        #        run_all.py 跑了 redteam_ext，打了"合计"那行，
+        #        用 known 过滤掉我们不同意的条目，然后……
+        #        没有 if r.returncode，没有 failed_modules.append，
+        #        没有 total_fail +=
+        #
+        #    结果：322 条断言是装饰性的。
+        #    哪天 F-01 符号链接那个洞被改回去，CI 照样绿。
+        #
+        #    这跟我们自己写在 PITFALLS 里的话是一回事：
+        #    「假成功比失败更害人」。
+        #    加 CI 是为了消灭假绿，结果在 CI 里造了一个假绿。
+        #
+        #    现在：白名单之外的真失败要计进 failed_modules，
+        #    让退出码变红。分歧照样显式记录在 known 里，
+        #    但"分歧"和"失败"是两件事，不能混。
         known = ("::ffff:127.0.0.1", "提示注入未绕过闸门")
+        rt_real_fail = 0
         for line in (r.stdout or "").splitlines():
             t = line.strip()
             if t.startswith("·") and not any(k in t for k in known):
+                rt_real_fail += 1
                 print(f"    {t}")
+
+        # ⚠️ 判断顺序要小心。
+        #
+        #    第一版写的是：先看 rt_real_fail，再看 returncode。
+        #    结果正常情况也变红了 —— 因为红队脚本有 6 条我们不同意的失败，
+        #    它自己 sys.exit(1)，而过滤之后 rt_real_fail 是 0，
+        #    于是走了"异常"分支。
+        #
+        #    正确的顺序：
+        #        1. 先看过滤后有没有真失败
+        #        2. 没有真失败，而且退出码非 0 → 才怀疑脚本自己崩了
+        #
+        #    而且"脚本崩了"的判据不能只看退出码 —— 红队脚本
+        #    有失败条目时本来就返回 1。要区分"有失败"和"崩了"，
+        #    得看它有没有把"合计"那行打出来：
+        #        打出来了   → 跑完了，失败就是失败
+        #        没打出来   → 中途崩了
+        printed_summary = any(
+            "合计" in ln for ln in (r.stdout or "").splitlines()
+        )
+
+        if rt_real_fail:
+            failed_modules.append(f"红队扩展({rt_real_fail})")
+            total_fail += rt_real_fail
+        elif r.returncode != 0 and not printed_summary:
+            # 没打印"合计"就退出了 → 脚本自己崩了
+            failed_modules.append("红队扩展(异常)")
+            total_fail += 1
+            print(f"    ⚠️ 红队脚本退出码 {r.returncode}，且没打印合计行")
+            tail = (r.stdout or "")[-800:] + (r.stderr or "")[-800:]
+            for ln in tail.splitlines()[-20:]:
+                print(f"       {ln}")
+        elif printed_summary and any(k for k in known):
+            # 有失败，但全在白名单里 —— 这是我们明确不同意的，不算红
+            pass
 
     # ── 暴力攻击测试 ──
     #
@@ -193,7 +248,21 @@ def main() -> int:
         print(f"  失败模块：{', '.join(failed_modules)}")
     print("=" * 66)
 
-    return 0 if total_fail == 0 else 1
+    # ⚠️ 退出码要同时看 total_fail 和 failed_modules。
+    #
+    #    原来只有 `0 if total_fail == 0 else 1`，而 total_fail
+    #    只从 pytest 输出里正则抓 "(\d+) failed" 累加。
+    #
+    #    brute_force.py 失败时是 failed_modules.append 的，
+    #    **不参与这个判断** —— 所以哪怕暴力攻击挂了，
+    #    run_all.py 照样 exit 0。
+    #
+    #    这条之前被掩盖了：CI 把 brute_force.py 单独列了一个 step，
+    #    靠那一步的 returncode 兜住。但只跑 run_all.py 的人
+    #    （比如本地开发）会看到假的"0 失败"。
+    #
+    #    现在两个都要过才算过。
+    return 0 if (total_fail == 0 and not failed_modules) else 1
 
 
 if __name__ == "__main__":

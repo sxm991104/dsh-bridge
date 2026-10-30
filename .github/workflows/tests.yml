@@ -61,6 +61,59 @@ jobs:
       - name: 跑回归测试
         run: python tests/run_all.py
 
+      # ⚠️ 红队脚本单独跑一遍，跟 run_all 里那次是两层保险。
+      #
+      #    有人指出过：run_all.py 里跑 redteam_ext，但没把它的失败
+      #    接进退出码，于是 322 条断言是装饰性的。
+      #    run_all 那边已经修了（白名单外的真失败会计数）。
+      #
+      #    这里再单独跑一次，是因为：
+      #        run_all 里的白名单是我们自己维护的，
+      #        万一哪天有人不小心把关键条目加进 known，
+      #        run_all 就会变绿，而这一步不会 ——
+      #        它能看见脚本的原始退出码。
+      #
+      #    已知会失败的那几条（我们明确不同意的）在这里也会显示，
+      #    但这一步的判据是"除了 known 之外还有没有真失败"，
+      #    所以正常的红队结果不会让它变红。
+      - name: 跑红队测试
+        shell: bash
+        run: |
+          # 红队脚本自己会因为"我们不同意的 6 条"返回 1，
+          # 所以不能直接看它的退出码。
+          #
+          # 判据：把已知不同意的条目过滤掉，看还剩不剩失败。
+          #
+          # 用 bash 是为了两个平台行为一致
+          # （Windows runner 上也有 bash，来自 Git for Windows）。
+          set +e
+          python tests/redteam_ext.py . > /tmp/rt.log 2>&1
+          rc=$?
+          set -e
+
+          cat /tmp/rt.log
+
+          KNOWN="::ffff:127.0.0.1|提示注入未绕过闸门"
+          REAL=$(grep -c '^\s*·' /tmp/rt.log 2>/dev/null || true)
+          REAL=${REAL:-0}
+          FILTERED=$(grep '^\s*·' /tmp/rt.log 2>/dev/null | grep -vE "$KNOWN" | wc -l || true)
+
+          echo "--- 红队统计 ---"
+          echo "失败条目：$REAL ，其中白名单外：$FILTERED"
+
+          if [ "$FILTERED" -gt 0 ]; then
+            echo "::error::红队有 $FILTERED 条白名单外的真失败"
+            exit 1
+          fi
+
+          # 没打印"合计"说明脚本崩了
+          if ! grep -q '合计' /tmp/rt.log; then
+            echo "::error::红队脚本没跑完（没有合计行），退出码 $rc"
+            exit 1
+          fi
+
+          echo "红队通过（$REAL 条失败全在我们明确不同意的白名单里）"
+
       - name: 跑暴力攻击测试
         run: python tests/brute_force.py
 
