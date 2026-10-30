@@ -281,18 +281,20 @@ def _build_args(command: str) -> list[str]:
         if parts:
             return parts
 
-    # ⚠️ 走 cmd 之前先切代码页到 UTF-8。
+    # ⚠️ 不在这里拼 chcp。
     #
-    #    cmd.exe 的输出编码跟着代码页走（chcp 的原意就是这个）。
-    #    英文 Windows 的默认代码页是 cp1252，里面没有中文，
-    #    于是 `echo 中文` 在字节层面就已经变成 `????` 了——
-    #    后面的解码再怎么修都救不回来。
+    #    试过 `["cmd", "/c", "chcp 65001 >nul & " + command]`，CI 上还是乱码。
     #
-    #    `chcp 65001 >nul` 把代码页切到 UTF-8，输出就是 UTF-8 字节。
-    #    `>nul` 是为了不把 "Active code page: 65001" 这行也吐给模型。
+    #    原因是执行顺序：
+    #        cmd 收到整个命令行 → **先按当前代码页解析中文** → 再执行 chcp
+    #    所以 chcp 生效的时候，中文已经在参数解析阶段变成 ? 了。
     #
-    #    这一条也是 CI 打出来的：中文 Windows（936）上测不出来。
-    return ["cmd", "/c", "chcp 65001 >nul & " + command]
+    #    换新控制台（CREATE_NO_WINDOW）时默认代码页是系统 ANSI 页，
+    #    英文 Windows 是 cp1252，没有中文字符。
+    #
+    #    → 代码页必须在 cmd 启动之前就定下来。
+    #      见 _run_on_windows()。
+    return ["cmd", "/c", command]
 
 
 def _split_command(command: str) -> list[str]:
@@ -535,6 +537,82 @@ def search_files(pattern: str, path: str = ".", glob_filter: str = "") -> str:
     return "\n".join(hits) + f"\n（共 {len(hits)} 处）"
 
 
+def _run_on_windows(command: str, work_dir: str, env: dict, timeout: int):
+    """Windows 上跑一条命令，用"写文件再执行"的方式保住中文。
+
+    ⚠️ 为什么不用命令行参数传命令：
+
+        cmd.exe 拿到命令行之后，会按**当前代码页**把它转成 ANSI
+        再解析。英文 Windows 的代码页是 cp1252——里面没有中文字符，
+        中文在这一步就变成 ? 了。
+
+        而且这个转换发生在 chcp 生效**之前**，所以
+        "chcp 65001 & echo 中文" 也救不了：
+        chcp 换的是之后的输出编码，中文参数早就坏了。
+
+        在中文 Windows（代码页 936）上测不出来，因为 GBK 有中文。
+
+    做法：
+
+        1. 把命令写成 UTF-8 的 .bat 文件
+        2. 命令行只传给 cmd 三样东西，全是 ASCII：
+              chcp 65001 >nul   切代码页
+              call 文件名        执行
+        3. 删掉临时文件
+
+    返回形状和 subprocess.CompletedProcess 一样，
+    调用方不用分平台处理。超时返回 None。
+    """
+    import tempfile
+
+    class _Result:
+        __slots__ = ("returncode", "stdout", "stderr", "_start_failed", "_err")
+
+        def __init__(self, returncode=0, stdout=b"", stderr=b""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+            self._start_failed = False
+            self._err = ""
+
+    try:
+        fd, bat = tempfile.mkstemp(prefix="dshcmd_", suffix=".bat")
+        os.close(fd)
+    except OSError as e:
+        r = _Result()
+        r._start_failed = True
+        r._err = str(e)
+        return r
+
+    try:
+        with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write("@echo off\r\n")
+            f.write(command)
+            f.write("\r\n")
+
+        try:
+            return subprocess.run(
+                ["cmd", "/c", "chcp 65001 >nul & call " + bat],
+                cwd=work_dir,
+                env=env,
+                capture_output=True,
+                timeout=max(5, min(timeout, 600)),
+                creationflags=_nowindow_flags(),
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        except OSError as e:
+            r = _Result()
+            r._start_failed = True
+            r._err = str(e)
+            return r
+    finally:
+        try:
+            os.remove(bat)
+        except OSError:
+            pass
+
+
 def run_command(command: str, cwd: str = "", timeout: int = 120) -> str:
     """跑一条命令。
 
@@ -569,21 +647,49 @@ def run_command(command: str, cwd: str = "", timeout: int = 120) -> str:
     env["PYTHONUTF8"] = "1"
     env.pop("PYTHONLEGACYWINDOWSSTDIO", None)
 
-    args = _build_args(command)
+    # ⚠️ Windows 上走"写文件再执行"，不走命令行参数。
+    #
+    #    为什么：命令行参数在两处会丢中文——
+    #
+    #        1. 父进程用 CreateProcessW 传的是 Unicode，
+    #           但 cmd.exe 拿到之后会按**当前代码页**转成 ANSI 再解析。
+    #           英文 Windows 的代码页是 cp1252，没有中文字符 → 变成 ?
+    #           而且这个转换发生在 chcp 生效之前——
+    #           所以 "chcp 65001 & echo 中文" 也救不了。
+    #
+    #        2. 就算能救，CREATE_NO_WINDOW 起的新控制台默认代码页
+    #           又是系统 ANSI 页，每开一次都要重新处理一遍。
+    #
+    #    改成：把整条命令写成 UTF-8 文件，再用
+    #        cmd /c "chcp 65001 >nul & call 文件.bat"
+    #    执行。这样命令行参数里只有 ASCII（文件名），
+    #    中文全在文件里，代码页切换在读取文件之前就生效了。
+    #
+    #    这是 CI 打出来的：中文 Windows（936）上一直是绿的。
+    if sys.platform == "win32":
+        r = _run_on_windows(command, work_dir, env, timeout)
+    else:
+        args = _build_args(command)
+        try:
+            r = subprocess.run(
+                args,
+                cwd=work_dir,
+                env=env,
+                capture_output=True,
+                timeout=max(5, min(timeout, 600)),
+                creationflags=_nowindow_flags(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"命令超时（{timeout} 秒）被中止：{command}"
+        except OSError as e:
+            return f"起不来：{e}"
 
-    try:
-        r = subprocess.run(
-            args,
-            cwd=work_dir,
-            env=env,
-            capture_output=True,
-            timeout=max(5, min(timeout, 600)),
-            creationflags=_nowindow_flags(),
-        )
-    except subprocess.TimeoutExpired:
+    if r is None:
         return f"命令超时（{timeout} 秒）被中止：{command}"
-    except OSError as e:
-        return f"起不来：{e}"
+
+    # ── 如果上面是"起不来"，_run_on_windows 会返回一个假的完成对象 ──
+    if getattr(r, "_start_failed", False):
+        return f"起不来：{getattr(r, '_err', '')}"
 
     out = _decode_output(r.stdout or b"")
     err = _decode_output(r.stderr or b"")
