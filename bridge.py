@@ -264,6 +264,19 @@ def _read_tasks() -> list[dict]:
 # 宁可这一条更新失败，也不能把整个文件写坏。
 if os.name == "nt":
     import msvcrt
+else:
+    # ⚠️ Linux / macOS 用 fcntl.flock。
+    #
+    #    原来这里只有 Windows 的分支，而 __enter__ 里直接用了 msvcrt。
+    #    在 Linux 上 msvcrt 根本没导入 → NameError。
+    #
+    #    CI 一跑就暴露：
+    #        NameError: name 'msvcrt' is not defined
+    #    而且因为这里没有 try 包住，整个任务写入都挂了。
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
 
 
 class _TaskLock:
@@ -279,7 +292,12 @@ class _TaskLock:
             # 等最多 10 秒；每个写操作都很快，正常不会等这么久
             for _ in range(200):
                 try:
-                    msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    if os.name == "nt":
+                        msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    elif fcntl is not None:
+                        fcntl.flock(self.fh.fileno(),
+                                    fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    # 拿不到锁就等 50ms 再试，最多 10 秒
                     return self
                 except OSError:
                     time.sleep(0.05)
@@ -290,7 +308,10 @@ class _TaskLock:
     def __exit__(self, *exc):
         if self.fh is not None:
             try:
-                msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+                if os.name == "nt":
+                    msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+                elif fcntl is not None:
+                    fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
             except OSError:
                 pass
             try:

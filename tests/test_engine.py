@@ -212,7 +212,28 @@ def test_cmd_builtin_still_works(workdir: str) -> None:
 
 
 def test_build_args_quoted() -> None:
-    """有引号 → 自己拆。"""
+    """有引号 → 自己拆。
+
+    ⚠️ 只在 Windows 上这么断言。
+
+        _build_args 的职责是"把用户写的命令变成 subprocess 参数"，
+        而两个平台的做法不同：
+
+            Windows  有引号时自己拆（因为 cmd 会吃引号）
+                     没引号时走 cmd /c（这样 dir/type 这些内置命令能用）
+            Linux    永远是 ["/bin/sh", "-c", command]
+                     shell 本来就处理引号，不需要我们拆
+
+        原来这条没加平台判断，CI 上（Linux）当然对不上。
+    """
+    if sys.platform != "win32":
+        # Linux：走 sh -c，引号原样保留
+        args = tools._build_args('python -c "print(1)"')
+        assert args[0] == "/bin/sh"
+        assert args[1] == "-c"
+        assert args[2] == 'python -c "print(1)"'
+        return
+
     args = tools._build_args('python -c "print(1)"')
     assert args == ["python", "-c", "print(1)"]
 
