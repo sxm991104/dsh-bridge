@@ -53,6 +53,17 @@ MAX_OUTPUT_CHARS = 20_000
 #    所有相对路径都以那里为准。
 _WORKDIR: str = os.getcwd()
 
+# 当前任务的权限级别。
+#
+# 老爸的设计：**默认工作区权限。**
+#
+#     工作区    只能动它自己那个任务目录
+#     用户目录  能动 ~ 下面的东西
+#     完全      整个电脑
+#
+# 要提权得单独给那个窗口设——不是默认就全开。
+_LEVEL: str = "workspace"
+
 
 def set_workdir(path: str) -> None:
     """设定这一轮任务的工作目录。agent 开跑前调用。"""
@@ -65,19 +76,54 @@ def workdir() -> str:
     return _WORKDIR
 
 
+def set_level(level: str) -> None:
+    """设定这一轮任务的权限级别。agent 开跑前调用。"""
+    global _LEVEL
+    if level in ("workspace", "home", "full"):
+        _LEVEL = level
+
+
+def level() -> str:
+    return _LEVEL
+
+
 def _resolve(path: str) -> str:
-    """把模型给的路径解析成绝对路径。
+    """把模型给的路径解析成绝对路径。**顺便做权限检查。**
 
     相对路径以任务工作目录为准；绝对路径原样用。
     ~ 会展开成用户目录。
+
+    ⚠️ 权限检查放在这里，是因为**所有文件工具都经过它**：
+
+        read_file / write_file / edit_file / list_dir / search_files
+        run_command 的 cwd
+
+        一个地方把关，比每个工具各加一遍靠谱得多——
+        漏一个就是漏洞。
+
+    默认权限是"工作区"，也就是只能在任务自己的目录里动。
+    要碰外面，得给那个窗口单独提权。
     """
     p = (path or "").strip().strip('"')
     if not p:
         return _WORKDIR
+
     p = os.path.expanduser(p)
     if not os.path.isabs(p):
         p = os.path.join(_WORKDIR, p)
-    return os.path.normpath(p)
+    p = os.path.normpath(p)
+
+    try:
+        import task_perms as _tp
+
+        if not _tp.is_allowed(p, _LEVEL, _WORKDIR):
+            # 抛出去，让调用方当"工具失败"处理——
+            # 模型会看到这段说明，知道是权限不够，不是文件不存在。
+            raise PermissionError(_tp.explain_denied(p, _LEVEL))
+    except ImportError:
+        pass
+
+    return p
 
 
 def _nowindow_flags() -> int:

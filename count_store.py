@@ -61,6 +61,7 @@ import os
 import secrets
 import sys
 import tempfile
+import threading
 
 # ── 文件位置 ────────────────────────────────────────────
 
@@ -566,20 +567,38 @@ def _today() -> str:
     return datetime.now(bj).strftime("%Y-%m-%d")
 
 
+# 读写锁。
+#
+# ⚠️ 暴力测试打出来的：5 个线程各 bump 30 次，
+#    跑完计数只有 31（应该是 150）。
+#
+#    原因：load() 和 save() 之间没锁。两个线程同时读到 count=10，
+#    各自加一存回 11，等于白白丢了 149 次。
+#
+#    这在正常使用里不太会撞上（一天被拦三次就锁死了），
+#    但攻击者可以用并发来"洗掉"计数——正是我们需要防的事。
+_LOCK = threading.RLock()
+
+
 def bump() -> dict:
-    """记一次拦截。返回更新后的计数。"""
-    d = load()
+    """记一次拦截。返回更新后的计数。
 
-    today = _today()
-    if d.get("date") != today:
-        # 换天了，计数从头来
-        d["date"] = today
-        d["count"] = 0
+    整段加锁：读-改-写必须是一个原子操作，
+    不然并发时会互相覆盖（实测 150 次只剩 31 次）。
+    """
+    with _LOCK:
+        d = load()
 
-    d["count"] = int(d.get("count", 0)) + 1
-    d["updated"] = _now()
-    save(d)
-    return d
+        today = _today()
+        if d.get("date") != today:
+            # 换天了，计数从头来
+            d["date"] = today
+            d["count"] = 0
+
+        d["count"] = int(d.get("count", 0)) + 1
+        d["updated"] = _now()
+        save(d)
+        return d
 
 
 def peek() -> dict:

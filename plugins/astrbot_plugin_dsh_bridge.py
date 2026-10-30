@@ -131,16 +131,42 @@ class DshBridgePlugin(Star):
         want = (model_name or "").strip().lower()
         if not want:
             return ""
+        # ⚠️ 这里原来有个 bug，而且是"静默失败"那种。
+        #
+        #    写的是：
+        #        import urllib.request as _ur        ← 导入时起了别名
+        #        urllib.request.Request(...)         ← 但用的是原名
+        #
+        #    而顶层没有 import urllib，所以这里是 NameError。
+        #    外面套着 except Exception: return "" —— 异常被吞了，
+        #    函数安安稳稳返回空字符串，于是"没指定模型" → 用默认那套。
+        #
+        #    症状：用户说"三个派 deepseek 两个派 kimi"，
+        #          前台确实传了 model='deepseek'，
+        #          但**五条全跑在默认配置（Kimi）上**。
+        #          而且日志里一切正常，看不出来。
+        #
+        #    实测：5 条任务，profile 全是 'default'。
+        #
+        #    教训：except Exception 后面接 return 一个"正常值"，
+        #          等于把错误伪装成正常。要么返回错误，要么至少记一笔。
         try:
             import json as _json
             import urllib.request as _ur
 
             with _ur.urlopen(
-                urllib.request.Request("http://127.0.0.1:8790/api/engine/profiles", headers={"X-Token": _api_token()}),
+                _ur.Request(
+                    "http://127.0.0.1:8790/api/engine/profiles",
+                    headers={"X-Token": _api_token()},
+                ),
                 timeout=10,
             ) as r:
                 data = _json.loads(r.read())
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # 记一笔，别静默。静默的话下次还是查半天。
+            logger.warning(
+                f"[桥] 查模型配置失败，本条走默认：{type(e).__name__}: {e}"
+            )
             return ""
 
         profiles = data.get("profiles") or []
@@ -158,6 +184,46 @@ class DshBridgePlugin(Star):
                 return prof.get("id") or ""
 
         return ""
+
+    def _call_api(self, path: str, body: dict | None = None,
+                  timeout: int = 15) -> dict:
+        """调桥的 HTTP 接口。
+
+        跟 _call_bridge 的区别：
+            _call_bridge  走命令行（用来派活、跑任务）
+            _call_api     走 HTTP（用来读写配置）
+
+        token 在 %APPDATA%/dsh-bridge/api_token.txt 里。
+        """
+        import json as _json
+        import urllib.request as _ur
+
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        tp = os.path.join(base, "dsh-bridge", "api_token.txt")
+        try:
+            with open(tp, encoding="utf-8") as f:
+                token = f.read().strip()
+        except OSError as e:
+            return {"ok": False, "error": f"读不到 token：{e}"}
+
+        url = "http://127.0.0.1:8790" + path
+        data = _json.dumps(body).encode("utf-8") if body is not None else None
+        req = _ur.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json", "X-Token": token},
+            method="POST" if data is not None else "GET",
+        )
+        try:
+            with _ur.urlopen(req, timeout=timeout) as r:
+                return _json.loads(r.read())
+        except _ur.HTTPError as e:
+            try:
+                return _json.loads(e.read())
+            except Exception:  # noqa: BLE001
+                return {"ok": False, "error": f"HTTP {e.code}"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     def _call_bridge(self, args: list[str], timeout: int = 60) -> dict:
         """同步调 bridge.py，返回它打印的 JSON。"""
@@ -689,7 +755,7 @@ class DshBridgePlugin(Star):
                 pid = ""
                 try:
                     with _ur.urlopen(
-                urllib.request.Request("http://127.0.0.1:8790/api/engine/profiles", headers={"X-Token": _api_token()}),
+                _ur.Request("http://127.0.0.1:8790/api/engine/profiles", headers={"X-Token": _api_token()}),
                 timeout=10,
             ) as pr:
                         pdata = _json.loads(pr.read())
@@ -741,7 +807,7 @@ class DshBridgePlugin(Star):
             import urllib.request as _ur
 
             with _ur.urlopen(
-                urllib.request.Request("http://127.0.0.1:8790/api/engine/profiles", headers={"X-Token": _api_token()}),
+                _ur.Request("http://127.0.0.1:8790/api/engine/profiles", headers={"X-Token": _api_token()}),
                 timeout=10,
             ) as r:
                 data = _json.loads(r.read())
@@ -1043,6 +1109,177 @@ class DshBridgePlugin(Star):
     # ------------------------------------------------------------------
     # 调电脑端的模型和推理强度
     # ------------------------------------------------------------------
+
+    @filter.llm_tool(name="list_task_permissions")
+    async def list_task_permissions(self, event):
+        """看每个窗口现在是什么权限。
+
+        权限有三档：
+            工作区    只能动它自己那个任务目录（默认）
+            用户目录  能动你用户目录下的东西
+            完全      整个电脑都能动
+
+        **默认都是工作区。** 要碰外面得单独提权。
+
+        ⚠️ 怎么把结果告诉用户：
+            直接把我返回的内容转述过去就行，**别自己再排一遍表**。
+
+            为什么：
+                这里返回的是已经排好的紧凑格式。你要是再加工成
+                Markdown 表格，窗口名里的顿号、括号很容易跟表格的
+                分隔符撞上，整张表会错位——实测过一次，
+                42 个窗口挤在一格里，看着像乱码。
+
+            什么时候可以用表：
+                最多三五行、每格都是短词的时候（比如"模型 / 数量"）。
+                长内容一律**分行列**，不要塞表格。
+        """
+        # ⚠️ 这里传 None 不是 {}。
+        #
+        #    _call_api 的逻辑是 method="POST" if data is not None else "GET"，
+        #    所以传 {} 会被当成 POST —— 而 POST /api/perms 是"改权限"，
+        #    它要求必须给 name，于是返回 "没说是哪个窗口"。
+        #
+        #    实测症状：用户说"看看窗口权限"，前台回报"查不到：没说是哪个窗口"。
+        #    它查的其实是改权限的那个接口。
+        d = await asyncio.to_thread(self._call_api, "/api/perms", None)
+        if not d.get("ok"):
+            return f"查不到：{d.get('error', '')}"
+
+        labels = d.get("labels") or {}
+        tasks = d.get("tasks") or []
+        if not tasks:
+            return "还没有窗口。"
+
+        # ⚠️ 这里原来写的是 tasks[-20:]。
+        #
+        #    症状：用户问"你好6~15 的权限"，前台回"不在表里，
+        #          返回的 20 条全是别的窗口"。
+        #          它甚至自己猜成"这个接口查的是权限台账，不是窗口清单"。
+        #
+        #    真相很简单：只取了最后 20 个，前面 42 个被切掉了。
+        #    62 个窗口只显示 20 个，用户当然找不到自己刚派的活。
+        #
+        #    现在按**模型配置**分组显示，该有的都在：
+        #        每套配置下有哪些窗口、各自什么权限。
+
+        # 按 profile 分组
+        groups: dict[str, list[dict]] = {}
+        for t in tasks:
+            pid = t.get("profile") or ""
+            groups.setdefault(pid, []).append(t)
+
+        # 拿配置名字
+        names = {}
+        try:
+            pdata = await asyncio.to_thread(
+                self._call_api, "/api/engine/profiles", None
+            )
+            for prof in (pdata.get("profiles") or []):
+                names[prof.get("id") or ""] = prof.get("name") or ""
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 输出做成**一张能直接发的表**。
+        #
+        # ⚠️ 这里改过两次，原因是呈现效果。
+        #
+        #    第一版：每个窗口一行（· 你好1 / · 你好2 ...）
+        #           62 个窗口 = 62 行，前台自己压成了"你好 1、2、3、
+        #           4、5、9..."塞进一格，而分隔符 `|` 跟 Markdown
+        #           表格的列分隔符撞了，飞书把内容当成了新列——
+        #           整个表错位。
+        #
+        #    第二版（现在）：每个模型一行，窗口名用「、」连起来，
+        #           超过一部分就省略。
+        #           好处是：一行一个模型，宽度可控，不撞分隔符。
+
+        out = []
+        out.append(f"共 {len(tasks)} 个窗口，按模型分组。默认全是工作区权限。")
+        out.append("")
+
+        for pid, items in groups.items():
+            title = names.get(pid) or ("默认" if not pid else pid)
+
+            # 有提权的单独标出来
+            raised = [
+                t for t in items
+                if (t.get("level") or "workspace") != "workspace"
+            ]
+
+            ns = [t.get("name") or "" for t in items]
+            # 一格里最多列 12 个，多了省略。
+            # 12 是因为中文名字平均 4-6 字，12 个大约一行半，
+            # 再读得下去；同时不会把表格撑爆。
+            shown = "、".join(ns[:12])
+            if len(ns) > 12:
+                shown += f"……（还有 {len(ns) - 12} 个）"
+
+            perm = "全是工作区"
+            if raised:
+                perm = "；".join(
+                    f"{t.get('name')} → {labels.get(t.get('level'), t.get('level'))}"
+                    for t in raised
+                )
+            out.append(f"【{title}】{len(items)} 个：{shown}")
+            out.append(f"    权限：{perm}")
+            out.append("")
+
+        out.append("要改权限就说「把某个窗口开到完全权限」——升权会要验证码。")
+        return "\n".join(out)
+
+    @filter.llm_tool(name="set_task_permission")
+    async def set_task_permission(self, event, task_name: str = "",
+                                  level: str = "", code: str = ""):
+        """给某个窗口改权限。
+
+        参数：
+            task_name  哪个窗口（任务名，就是派活时起的那个名字）
+            level      workspace / home / full
+            code       验证码。**升权时第一次不要传**，系统会发码到邮箱，
+                       用户把码报给你之后，再带 code 调一次。
+
+        ⚠️ 规矩：
+            一、只能改**一个**窗口，说名字。不能批量、不能通配。
+            二、升权（放宽）必须过验证码；降权（收窄）直接改。
+            三、只在用户**明确要求**时用。不要自己觉得"这活需要更多权限"
+                就去提权——提权是件用户该知道的事。
+        """
+        if not task_name:
+            return "要改哪个窗口？说任务名。"
+
+        if level not in ("workspace", "home", "full"):
+            return (
+                f"权限只有三档：workspace（工作区）/ home（用户目录）/ "
+                f"full（完全），你给的是 {level}"
+            )
+
+        d = await asyncio.to_thread(
+            self._call_api, "/api/perms",
+            {"name": task_name, "level": level, "code": code},
+        )
+
+        # 需要验证码
+        if d.get("need_code"):
+            frm = d.get("from") or "工作区"
+            return (
+                f"「{task_name}」现在是 {frm}，要开到「{level}」得先验证身份。\n"
+                f"{d.get('message') or d.get('error') or '验证码已发到邮箱。'}\n"
+                f"把码报给我，我来改。"
+            )
+
+        if not d.get("ok"):
+            return f"没改成：{d.get('error', '')}"
+
+        label = d.get("label") or level
+        hint = d.get("hint") or ""
+        frm = d.get("from") or ""
+        changed = f"（{frm} → {label}）" if frm and frm != label else f"（{label}）"
+        return f"改好了：\u300c{task_name}\u300d{changed}——{hint}"
+
+
+
+
 
     def _call_tune(self, args: list[str], timeout: int = 30) -> dict:
         """调 tune_model.py。"""

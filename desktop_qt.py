@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -181,6 +183,21 @@ def _token() -> str:
 
 
 # 兼容旧引用
+def _text_width(text: str, size: int = 11) -> int:
+    """粗估一段文字的像素宽度。
+
+    为什么要估：
+        名字列的宽度要按最长的那个定，不然每行宽窄不一，看着乱。
+
+        中文字符大约是字号的 1 倍宽，英文和数字大概 0.55 倍。
+        估个大概就行——差几个像素看不出来，差一整行才难看。
+    """
+    w = 0.0
+    for ch in str(text):
+        w += 1.0 if ord(ch) > 0x2E80 else 0.55
+    return int(w * size)
+
+
 class _TokenProxy:
     def __str__(self) -> str:
         return _token()
@@ -940,6 +957,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_tasks_page())
         self.stack.addWidget(self._build_services_page())
+        self.stack.addWidget(self._build_deps_page())
         self.stack.addWidget(self._build_settings_page())
         body.addWidget(self.stack, 1)
 
@@ -1143,7 +1161,7 @@ class MainWindow(QMainWindow):
         lay.setSpacing(4)
 
         self.nav_btns = []
-        for text, idx in (("任务", 0), ("服务", 1), ("设置", 2)):
+        for text, idx in (("任务", 0), ("服务", 1), ("环境", 2), ("设置", 3)):
             b = QPushButton(text)
             b.setObjectName("nav")
             b.setCheckable(True)
@@ -1154,7 +1172,7 @@ class MainWindow(QMainWindow):
         self.nav_btns[0].setChecked(True)
 
         lay.addStretch()
-        ver = QLabel("v1.3.1")
+        ver = QLabel("v1.3.2")
         ver.setFont(font(10))
         ver.setStyleSheet(f"color:{C_DIM2}; padding:0 16px;")
         lay.addWidget(ver)
@@ -1165,6 +1183,8 @@ class MainWindow(QMainWindow):
         for i, b in enumerate(self.nav_btns):
             b.setChecked(i == idx)
         if idx == 2:
+            self._refresh_deps()
+        if idx == 3:
             self._load_profiles()
             self._load_paths()
             self._load_guard()
@@ -1272,6 +1292,348 @@ class MainWindow(QMainWindow):
         for k, b in self.chip_btns:
             b.setChecked(k == key)
         self._render_tasks()
+
+    # ── 环境页 ──
+    def _build_deps_page(self) -> QWidget:
+        """运行环境：缺什么一眼看到，点一下装上。
+
+        布局为什么这样排
+            上一版是"名字框固定宽度 + 说明框铺满"，
+            结果名字框和版本号之间空一大块，右边也空着，很难看。
+
+            现在一行三块：
+                [●] 名字        说明（版本号或用途）        [按钮] [必需/可选]
+            按钮靠右对齐，名字宽度按最长的那个定死，
+            这样每一行都对齐，不会有的宽有的窄。
+        """
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(28, 24, 28, 22)
+        lay.setSpacing(12)
+
+        # ── 标题 ──
+        head = QVBoxLayout()
+        head.setSpacing(4)
+        h = QLabel("环境")
+        h.setFont(font(19, QFont.Bold))
+        h.setStyleSheet(f"color:{C_TEXT};")
+        sub = QLabel("跑起来需要什么，缺什么，这里都能看到。")
+        sub.setFont(font(11))
+        sub.setStyleSheet(f"color:{C_DIM};")
+        head.addWidget(h)
+        head.addWidget(sub)
+        lay.addLayout(head)
+
+        # ── 环境信息 ──
+        self.lbl_env = QLabel("")
+        self.lbl_env.setFont(font(10))
+        self.lbl_env.setStyleSheet(f"color:{C_DIM2};")
+        self.lbl_env.setWordWrap(True)
+        lay.addWidget(self.lbl_env)
+
+        lay.addSpacing(4)
+
+        # ── 依赖列表 ──
+        #
+        # 整体一个卡片，行与行之间一条发丝线。
+        # 不再每行单独加边框——那样看着像被切成好几块。
+        card = QFrame()
+        card.setObjectName("depcard")
+        card.setStyleSheet(
+            f"QFrame#depcard{{background:{C_SURFACE};"
+            f"border:1px solid {C_LINE}; border-radius:10px;}}"
+        )
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(14, 7, 14, 7)
+        card_lay.setSpacing(0)
+
+        self.deps_box = QVBoxLayout()
+        self.deps_box.setSpacing(0)
+        card_lay.addLayout(self.deps_box)
+        lay.addWidget(card)
+
+        lay.addStretch()
+
+        # ── 底部：总进度 + 按钮 ──
+        self.prog_deps = QProgressBar()
+        self.prog_deps.setRange(0, 100)
+        self.prog_deps.setValue(0)
+        self.prog_deps.setTextVisible(False)
+        self.prog_deps.setFixedHeight(6)
+        self.prog_deps.setStyleSheet(
+            f"QProgressBar{{background:{C_LINE}; border:none; border-radius:3px;}}"
+            f"QProgressBar::chunk{{background:{C_ACCENT}; border-radius:3px;}}"
+        )
+        self.prog_deps.hide()
+        lay.addWidget(self.prog_deps)
+
+        self.lbl_prog = QLabel("")
+        self.lbl_prog.setFont(font(10))
+        self.lbl_prog.setStyleSheet(f"color:{C_DIM};")
+        self.lbl_prog.setWordWrap(True)
+        self.lbl_prog.hide()
+        lay.addWidget(self.lbl_prog)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self.btn_install = QPushButton("装上缺的")
+        self.btn_install.setCursor(Qt.PointingHandCursor)
+        self.btn_install.setFixedHeight(36)
+        self.btn_install.setMinimumWidth(120)
+        self.btn_install.clicked.connect(self._install_deps)
+
+        self.btn_recheck = QPushButton("重新检查")
+        self.btn_recheck.setCursor(Qt.PointingHandCursor)
+        self.btn_recheck.setFixedHeight(36)
+        self.btn_recheck.setObjectName("ghost")
+        self.btn_recheck.clicked.connect(self._refresh_deps)
+
+        btn_row.addWidget(self.btn_install)
+        btn_row.addWidget(self.btn_recheck)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        self._dep_rows: dict[str, dict] = {}
+        self._installing = False
+        return page
+
+    def _refresh_deps(self) -> None:
+        """重新查一遍，重画列表。"""
+        try:
+            import deps as _deps
+        except ImportError:
+            self.lbl_env.setText("读不到 deps 模块。检查一下 deps.py 在不在。")
+            return
+
+        # 清空
+        while self.deps_box.count():
+            item = self.deps_box.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._dep_rows.clear()
+
+        info = _deps.env_info()
+        self.lbl_env.setText(f"Python {info['python']}   ·   {info['platform']}")
+
+        items = _deps.check_all()
+
+        # 名字列按最长的定宽，保证对齐
+        name_w = max((_text_width(it["label"]) for it in items), default=100)
+
+        for idx, it in enumerate(items):
+            # 行之间加一条发丝线（第一行不加）
+            if idx > 0:
+                line = QFrame()
+                line.setFixedHeight(1)
+                line.setStyleSheet(f"background:{C_LINE}; border:none;")
+                self.deps_box.addWidget(line)
+
+            row = self._make_dep_row(it, _deps, name_w)
+            self.deps_box.addWidget(row)
+            self._dep_rows[it["key"]] = it
+
+        # 按钮
+        miss = _deps.missing(items)
+        if self._installing:
+            self.btn_install.setEnabled(False)
+            self.btn_install.setText("正在装…")
+        elif miss:
+            self.btn_install.setEnabled(True)
+            self.btn_install.setText(f"装上缺的（{len(miss)} 个）")
+        else:
+            # ⚠️ 都齐了也不能把按钮藏起来——
+            #    用户看不到这个按钮，就不知道有这个功能。
+            self.btn_install.setEnabled(False)
+            self.btn_install.setText("都齐了")
+
+    def _make_dep_row(self, it: dict, _deps, name_w: int) -> QWidget:
+        """造一行。
+
+        排版目标：
+            ●  Python          3.12.10              必需
+            ●  python-docx     1.2.0                可选
+            ●  AstrBot         D:\\qqaibot\\astrbot  [选择…]  可选
+
+        三列对齐，中间那列吃掉多余宽度。
+        不逐个加边框——那样看着像被切开的几块。
+        """
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(2, 7, 2, 7)
+        rl.setSpacing(0)
+
+        # ── 状态点 ──
+        dot = QLabel("●")
+        dot.setFont(font(9))
+        dot.setFixedWidth(16)
+        dot.setAlignment(Qt.AlignCenter)
+        if it["installed"]:
+            dot.setStyleSheet(f"color:{C_OK}; border:none;")
+        elif it.get("needed"):
+            dot.setStyleSheet(f"color:{C_BAD}; border:none;")
+        else:
+            dot.setStyleSheet(f"color:{C_WARN}; border:none;")
+        rl.addWidget(dot)
+
+        # ── 名字（固定宽度，保证对齐）──
+        name = QLabel(it["label"])
+        name.setFont(font(11, QFont.Bold))
+        name.setStyleSheet(f"color:{C_TEXT}; border:none;")
+        name.setFixedWidth(name_w)
+        rl.addWidget(name)
+
+        rl.addSpacing(12)
+
+        # ── 说明（吃掉剩余空间）──
+        desc_text = it.get("version") or ""
+        if not desc_text:
+            desc_text = it.get("note") or it.get("why") or ""
+        desc = QLabel(desc_text)
+        desc.setFont(font(10))
+        desc.setStyleSheet(f"color:{C_DIM}; border:none;")
+        desc.setWordWrap(False)
+        # 关键：设成 Expanding，让它真正吃掉中间的空间，
+        # 而不是每列各占一块、中间留着空洞。
+        desc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        rl.addWidget(desc, 1)
+
+        # ── 右边：按钮 + 标签 ──
+        right = QHBoxLayout()
+        right.setSpacing(6)
+
+        if it.get("can_pick"):
+            pick = QPushButton("选择…")
+            pick.setCursor(Qt.PointingHandCursor)
+            pick.setFixedHeight(24)
+            pick.setStyleSheet(
+                f"QPushButton{{color:{C_DIM}; background:transparent;"
+                f"border:1px solid {C_LINE}; border-radius:6px;"
+                f"padding:0 10px; font-size:11px;}}"
+                f"QPushButton:hover{{background:{C_LINE};}}"
+            )
+            key = it["key"]
+            pick.clicked.connect(lambda _=False, k=key: self._pick_dep_path(k))
+            right.addWidget(pick)
+
+        if not it["installed"] and it.get("can_install"):
+            one = QPushButton("装它")
+            one.setCursor(Qt.PointingHandCursor)
+            one.setFixedHeight(24)
+            one.setStyleSheet(
+                f"QPushButton{{color:{C_ACCENT}; background:transparent;"
+                f"border:1px solid {C_ACCENT}; border-radius:6px;"
+                f"padding:0 10px; font-size:11px;}}"
+                f"QPushButton:hover{{background:{C_ACCENT}; color:white;}}"
+            )
+            pip_name = it.get("pip") or it["label"]
+            one.clicked.connect(
+                lambda _=False, pk=pip_name: self._install_one(pk)
+            )
+            right.addWidget(one)
+
+        tag = QLabel("必需" if it.get("needed") else "可选")
+        tag.setFont(font(9))
+        tag.setAlignment(Qt.AlignCenter)
+        tag.setFixedWidth(34)
+        if it.get("needed"):
+            tag.setStyleSheet(
+                f"color:{C_DIM2}; border:1px solid {C_LINE};"
+                f"border-radius:4px; padding:1px 0;"
+            )
+        else:
+            tag.setStyleSheet(
+                f"color:{C_DIM2}; border:1px solid {C_LINE};"
+                f"border-radius:4px; padding:1px 0;"
+            )
+        right.addWidget(tag)
+
+        rl.addLayout(right)
+        return row
+
+    def _pick_dep_path(self, key: str) -> None:
+        """让用户手动指一个目录。"""
+        try:
+            import deps as _deps
+        except ImportError:
+            return
+
+        d = QFileDialog.getExistingDirectory(
+            self, "选择 AstrBot 的目录", ""
+        )
+        if not d:
+            return
+
+        _deps.save_custom_path(key, d)
+        self._refresh_deps()
+
+    def _install_one(self, pip_name: str) -> None:
+        """装单个包。"""
+        self._run_install([pip_name])
+
+    def _install_deps(self) -> None:
+        """一键装所有缺的。"""
+        if self._installing:
+            return
+        try:
+            import deps as _deps
+        except ImportError:
+            return
+
+        miss = _deps.missing(_deps.check_all())
+        pkgs = [m["pip"] for m in miss if m.get("pip")]
+        if not pkgs:
+            return
+        self._run_install(pkgs)
+
+    def _run_install(self, pkgs: list[str]) -> None:
+        """真正去装。"""
+        try:
+            import deps as _deps
+        except ImportError:
+            return
+
+        self._installing = True
+        self.btn_install.setEnabled(False)
+        self.btn_install.setText("正在装…")
+        self.prog_deps.show()
+        self.prog_deps.setRange(0, 100)
+        self.prog_deps.setValue(0)
+        self.lbl_prog.show()
+        self.lbl_prog.setStyleSheet(f"color:{C_DIM};")
+        self.lbl_prog.setText(f"开始装 {len(pkgs)} 个…")
+
+        def on_progress(msg: str, pct: int) -> None:
+            QTimer.singleShot(0, lambda: self._on_install_progress(msg, pct))
+
+        def on_done(ok: bool, msg: str) -> None:
+            QTimer.singleShot(0, lambda: self._on_install_done(ok, msg))
+
+        _deps.install_async(pkgs, on_progress, on_done)
+
+    def _on_install_progress(self, msg: str, pct: int) -> None:
+        if pct < 0:
+            self.prog_deps.setRange(0, 0)
+        else:
+            self.prog_deps.setRange(0, 100)
+            self.prog_deps.setValue(pct)
+        self.lbl_prog.setText(msg[:180])
+
+    def _on_install_done(self, ok: bool, msg: str) -> None:
+        self._installing = False
+        self.prog_deps.setRange(0, 100)
+        self.prog_deps.setValue(100 if ok else 0)
+
+        if ok:
+            self.lbl_prog.setText("装好了")
+            self.lbl_prog.setStyleSheet(f"color:{C_OK};")
+            QTimer.singleShot(800, self._refresh_deps)
+        else:
+            self.lbl_prog.setText(msg[:300])
+            self.lbl_prog.setStyleSheet(f"color:{C_BAD};")
+            self.btn_install.setEnabled(True)
+            self.btn_install.setText("再试一次")
 
     # ── 服务页 ──
     def _build_services_page(self) -> QWidget:
@@ -2244,7 +2606,18 @@ class MainWindow(QMainWindow):
             rl.setSpacing(10)
 
             # 状态点
-            dot = GlowDot(C_OK if is_active else C_DIM2, 7)
+            #
+            # 三种状态要分开：
+            #   在用         绿（这套正在跑活）
+            #   启用但没在用  黄（可用，只是不是当前那套）
+            #   停用         灰（不参与派活）
+            is_on = prof.get("enabled", True)
+            if is_active:
+                dot = GlowDot(C_OK, 7)
+            elif is_on:
+                dot = GlowDot(C_WARN, 7)
+            else:
+                dot = GlowDot(C_DIM2, 7)
             rl.addWidget(dot, 0, Qt.AlignVCenter)
 
             # 名字（固定宽度，让后面的对齐）
@@ -2271,23 +2644,69 @@ class MainWindow(QMainWindow):
                 warn.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 rl.addWidget(warn)
 
-            # 右侧：在用的显示状态，不在用的显示启用按钮
-            if is_active:
-                tag = QLabel("✓ 正在用")
-                tag.setFont(font(10))
-                tag.setStyleSheet(f"color:{C_OK};")
-                tag.setFixedWidth(88)
-                tag.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                rl.addWidget(tag)
-            else:
-                act = QPushButton("启用")
-                act.setObjectName("ghost")
-                act.setCursor(Qt.PointingHandCursor)
-                act.setFixedSize(64, 26)
-                act.clicked.connect(
-                    lambda _=False, pid=prof["id"]: self._switch_profile(pid)
+            # 右侧：**每套独立开关** + 删除
+            #
+            # ⚠️ 这里改过一次，原来只有两种状态：
+            #        在用      显示"✓ 正在用"
+            #        没在用    [启用] ← 点了会切过去
+            #
+            #    但那不是"开关"，是"切换"。用户想的是：
+            #        这套先用着，那套先关掉
+            #    而不是"只能有一个在用，选另一个就换掉"。
+            #
+            #    现在每套都有自己的开关：
+            #        开着  这套参与派活（可以是多套同时开，各跑各的）
+            #        关着  不参与，队列里也不排它
+            #
+            #    另外"当前默认用哪套"是另一件事，点行本身来切。
+
+            # 开关
+            sw = QPushButton("开着" if is_on else "关着")
+            sw.setCursor(Qt.PointingHandCursor)
+            sw.setFixedSize(52, 26)
+            if is_on:
+                sw.setStyleSheet(
+                    f"QPushButton{{color:{C_OK}; background:transparent;"
+                    f"border:1px solid {C_OK}; border-radius:6px;"
+                    f"font-size:11px;}}"
+                    f"QPushButton:hover{{background:{C_OK}; color:white;}}"
                 )
-                rl.addWidget(act)
+            else:
+                sw.setStyleSheet(
+                    f"QPushButton{{color:{C_DIM2}; background:transparent;"
+                    f"border:1px solid {C_LINE}; border-radius:6px;"
+                    f"font-size:11px;}}"
+                    f"QPushButton:hover{{background:{C_LINE};}}"
+                )
+            sw.clicked.connect(
+                lambda _=False, pid=prof["id"], now=is_on: self._toggle_profile(pid, now)
+            )
+            rl.addWidget(sw)
+
+            # 当前那套加个标记
+            if is_active:
+                tag = QLabel("当前")
+                tag.setFont(font(9))
+                tag.setStyleSheet(
+                    f"color:{C_ACCENT}; border:1px solid {C_ACCENT};"
+                    f"border-radius:4px; padding:1px 5px;"
+                )
+                rl.addWidget(tag)
+
+            # 删除
+            dele = QPushButton("删")
+            dele.setCursor(Qt.PointingHandCursor)
+            dele.setFixedSize(30, 26)
+            dele.setStyleSheet(
+                f"QPushButton{{color:{C_DIM2}; background:transparent;"
+                f"border:1px solid {C_LINE}; border-radius:6px;"
+                f"font-size:11px;}}"
+                f"QPushButton:hover{{color:{C_BAD}; border-color:{C_BAD};}}"
+            )
+            dele.clicked.connect(
+                lambda _=False, pid=prof["id"]: self._delete_profile_by_id(pid)
+            )
+            rl.addWidget(dele)
 
             def on_click(_e, pid=prof["id"]):
                 self._selected_pid = pid
@@ -2379,6 +2798,74 @@ class MainWindow(QMainWindow):
         self.api.request_once("/api/engine/profiles",
                               {"action": "switch", "id": pid},
                               callback=done)
+
+    def _toggle_profile(self, pid: str, currently_on: bool) -> None:
+        """开/关一套模型配置。
+
+        ⚠️ 这是"开关"，不是"切换"。
+
+            以前只有一个 [启用] 按钮，点了会把"当前那套"换成它——
+            等于任何时刻只能有一套在跑。
+
+            但实际用起来不是这样：同时开 DeepSeek 和 Kimi 很常见，
+            两个各跑各的，任务按需分配。所以每套要独立开关。
+
+            "当前默认用哪套"是另一件事，点行本身来切。
+        """
+        target = not currently_on
+
+        # 不允许全关。
+        #
+        # 为什么：全关之后任何任务都跑不了，用户会以为程序坏了，
+        # 而且他还得先找到这里才能修好。
+        on_count = sum(1 for p in (self._profiles or []) if p.get("enabled", True))
+        if currently_on and on_count <= 1:
+            self.lbl_engine.setText("至少得留一套开着，不然没东西跑任务")
+            self.lbl_engine.setStyleSheet(f"color:{C_WARN}; font-size:11px;")
+            return
+
+        def done(data):
+            if isinstance(data, dict) and data.get("ok"):
+                self._load_profiles()
+            else:
+                self.lbl_engine.setText(
+                    f"没改成功：{(data or {}).get('error', '未知原因')}"
+                )
+
+        self.api.request_once(
+            "/api/engine/profiles",
+            {"action": "update", "id": pid, "enabled": target},
+            callback=done,
+        )
+
+    def _delete_profile_by_id(self, pid: str) -> None:
+        """从列表里直接删一套。"""
+        prof = next((x for x in (self._profiles or []) if x["id"] == pid), None)
+        name = (prof or {}).get("name") or "这套"
+
+        r = QMessageBox.question(
+            self,
+            "删除配置",
+            f"删掉「{name}」？\n\n只删这套的地址和 Key，已经做出来的任务不受影响。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if r != QMessageBox.Yes:
+            return
+
+        def done(data):
+            if isinstance(data, dict) and data.get("ok"):
+                self._load_profiles()
+            else:
+                self.lbl_engine.setText(
+                    f"没删掉：{(data or {}).get('error', '未知原因')}"
+                )
+
+        self.api.request_once(
+            "/api/engine/profiles",
+            {"action": "delete", "id": pid},
+            callback=done,
+        )
 
     def _load_engine(self) -> None:
         """把当前的模型配置读出来填进界面。key 不显示原文。"""

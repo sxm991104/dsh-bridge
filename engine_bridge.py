@@ -196,6 +196,9 @@ def dispatch(task: str, task_id: str, workdir: str,
             llm=llm,
             max_steps=int(cfg.get("max_steps") or 40),
             on_progress=on_progress,
+            # 这个窗口的权限级别从这里查。
+            # 默认工作区——只能在任务目录里动，要碰外面得单独提权。
+            task_name=task_id,
         )
     except Exception as e:  # noqa: BLE001
         return {

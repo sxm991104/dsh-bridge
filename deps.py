@@ -155,20 +155,76 @@ def check_all() -> list[dict]:
     return out
 
 
+def _astrbot_paths_file() -> str:
+    """用户手动指定的 AstrBot 路径存在这。"""
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "dsh-bridge", "paths.json")
+
+
+def load_custom_paths() -> dict:
+    """读用户手动指定的路径。
+
+    ⚠️ 为什么要有这个：
+        自动探测只查了几个常见位置。装在别处的人，
+        界面上永远是"没找到"——而他明明装了。
+        所以得让用户自己指一下，指过就记住。
+    """
+    p = _astrbot_paths_file()
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_custom_path(key: str, path: str) -> None:
+    """记住用户指定的路径。"""
+    d = load_custom_paths()
+    if path:
+        d[key] = path
+    else:
+        d.pop(key, None)
+
+    p = _astrbot_paths_file()
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
 def _check_astrbot() -> dict:
     """找 AstrBot 装在哪。
 
     它不一定跟我们同一个 Python 环境，所以不能 import。
-    查几个常见位置就够了。
+    先看用户指定的，再查几个常见位置。
     """
-    candidates = [
+    custom = load_custom_paths().get("astrbot") or ""
+
+    candidates = []
+    if custom:
+        candidates.append(custom)
+    candidates += [
         r"D:\qqaibot\astrbot",
         os.path.expanduser(r"~\astrbot"),
         r"C:\astrbot",
+        os.path.expanduser(r"~\Downloads\astrbot"),
     ]
 
     for p in candidates:
-        if os.path.isdir(p) and os.path.exists(os.path.join(p, "main.py")):
+        # 认两个特征文件，有一个就算装对了
+        looks_ok = (
+            os.path.isdir(p)
+            and (
+                os.path.exists(os.path.join(p, "main.py"))
+                or os.path.exists(os.path.join(p, "data"))
+            )
+        )
+        if looks_ok:
             return {
                 "key": "astrbot",
                 "label": "AstrBot",
@@ -177,7 +233,10 @@ def _check_astrbot() -> dict:
                 "why": "前台（接 QQ / 飞书）",
                 "needed": False,
                 "can_install": False,
+                "can_pick": True,          # 可以自己选
                 "note": p,
+                "path": p,
+                "is_custom": p == custom,
             }
 
     return {
@@ -188,7 +247,10 @@ def _check_astrbot() -> dict:
         "why": "前台（接 QQ / 飞书）",
         "needed": False,
         "can_install": False,
-        "note": "要接聊天平台才需要，单独安装",
+        "can_pick": True,              # 没找到也能自己指
+        "note": "没找到。装了的话点「选择…」指给我",
+        "path": "",
+        "is_custom": False,
     }
 
 

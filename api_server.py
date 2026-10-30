@@ -421,6 +421,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._profiles_get()
 
 
+        if path == "/api/perms":
+            try:
+                return self._send(*_json(self._perms_get()))
+            except Exception as e:  # noqa: BLE001
+                return self._send(
+                    *_json({"ok": False, "error": str(e)}, 500)
+                )
+
         if path == "/api/guard":
             try:
                 import guard
@@ -564,6 +572,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 st, b = _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
             return self._send(st, b)
+
+        if path == "/api/perms":
+            try:
+                return self._send(*_json(self._perms_set(body)))
+            except Exception as e:  # noqa: BLE001
+                return self._send(
+                    *_json({"ok": False, "error": str(e)}, 500)
+                )
 
         if path == "/api/guard":
             try:
@@ -1184,6 +1200,136 @@ class Handler(BaseHTTPRequestHandler):
             "passed": passed,
             "failed": len(results) - passed,
             "results": results,
+        }
+
+    # ── 权限 ──
+    def _perms_get(self) -> dict:
+        """列出每个窗口的权限。"""
+        import task_perms as tp
+
+        cfg = tp.load()
+        tasks = []
+        try:
+            import bridge as _b
+
+            for t in _b._read_tasks():
+                nm = t.get("id") or ""
+                if not nm:
+                    continue
+                tasks.append({
+                    "name": nm,
+                    "status": t.get("status"),
+                    "level": tp.get_level(nm),
+                    # 加 profile：前端要按模型分组显示。
+                    # 原来没这个字段，前台只能给一张扁平表，
+                    # 分不清哪个窗口跑在哪套模型上。
+                    "profile": t.get("profile") or "",
+                })
+        except Exception:  # noqa: BLE001
+            pass
+
+        tasks.sort(key=lambda x: str(x["name"]))
+
+        return {
+            "ok": True,
+            "levels": list(tp.LEVELS),
+            "labels": tp.LEVEL_LABEL,
+            "hints": tp.LEVEL_HINT,
+            "default": "workspace",
+            "tasks": tasks,
+            "custom": cfg,
+        }
+
+    def _perms_set(self, body: dict) -> dict:
+        """改一个窗口的权限。
+
+        body:
+            {"name": "任务名", "level": "workspace|home|full", "code": "可选"}
+
+        ⚠️ **升权必须过验证码。**
+
+            为什么：
+                权限档位是攻击者唯一需要拿下的那一个点。
+
+                如果他能在对话里直接说"帮我把那个窗口的权限调一下"，
+                那整套围栏就白做了——他不需要绕过围栏，
+                他只要让前台把围栏拆了。而且这个请求会伪装成
+                一次完全正常的远程办公操作。
+
+            分两种情况：
+                降权（收窄）  直接改。因为它只会让人更安全。
+                升权（放宽）  必须先过码，一次一码。
+
+            码绑的是"给『某个任务名』开『某个级别』"这一件事，
+            不能拿去干别的，也不能换个任务名复用。
+        """
+        import task_perms as tp
+
+        name = (body.get("name") or "").strip()
+        level = (body.get("level") or "").strip().lower()
+        code = (body.get("code") or "").strip()
+
+        if not name:
+            return {"ok": False, "error": "没说是哪个窗口"}
+        if level not in tp.LEVELS:
+            return {"ok": False, "error": f"不认识的权限级别：{level}"}
+
+        # 只能改点名的**一个**窗口。
+        #
+        # 通配符、批量，一律不认——
+        # "一次只开一扇门"是这套设计的前提。要是能一次开一片，
+        # 那攻击者只要成功一次就等于全开了。
+        if any(ch in name for ch in ("*", "?", "%")):
+            return {
+                "ok": False,
+                "error": "一次只能改一个窗口，不能批量",
+            }
+
+        cur = tp.get_level(name)
+        rank = {"workspace": 0, "home": 1, "full": 2}
+        widening = rank.get(level, 0) > rank.get(cur, 0)
+
+        purpose = f"perm:{name}:{level}"
+
+        if widening:
+            # 升权：必须有码
+            try:
+                import guard
+            except ImportError:
+                return {"ok": False, "error": "guard 模块不可用，没法验证"}
+
+            if not code:
+                # 第一次来：发码
+                ok, msg = guard.send_code_email(purpose, "改权限")
+                return {
+                    "ok": False,
+                    "need_code": True,
+                    "name": name,
+                    "from": cur,
+                    "to": level,
+                    "message": msg if ok else f"发码失败：{msg}",
+                }
+
+            # 带码来了：验
+            ok, msg = guard.verify(purpose, code)
+            if not ok:
+                return {
+                    "ok": False,
+                    "need_code": True,
+                    "error": msg,
+                }
+
+        if not tp.set_level(name, level):
+            return {"ok": False, "error": "没改成功"}
+
+        return {
+            "ok": True,
+            "name": name,
+            "from": cur,
+            "level": level,
+            "label": tp.LEVEL_LABEL.get(level, level),
+            "hint": tp.LEVEL_HINT.get(level, ""),
+            "verified": widening,
         }
 
     def _paths_get(self):

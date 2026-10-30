@@ -55,17 +55,38 @@ class Progress:
 
 
 def run(task: str, workdir: str, llm: LLM, max_steps: int = 40,
-        on_progress=None, should_stop=None) -> Progress:
+        on_progress=None, should_stop=None, task_name: str = "") -> Progress:
     """跑一个任务，返回过程记录。
 
     on_progress(Progress) 每轮调一次，用来报"现在在做什么"。
     should_stop() 返回 True 就中止（用户点了停）。
+    task_name 用来查这个窗口的权限级别。不传就按默认（工作区）。
     """
     prog = Progress()
 
     # 0) 先把工作目录定下来。
     #    模型给的相对路径都相对这里解析，不是相对"启动桥的那个目录"。
     tools.set_workdir(workdir)
+
+    # 0.5) 定权限级别。
+    #
+    #      默认是"工作区"——只能在任务自己的目录里动。
+    #      要碰外面，得给这个窗口单独提权（前端能改）。
+    #
+    #      为什么默认收紧：
+    #          任务端有完全权限是必要的（有些活就是要改别的项目）。
+    #          但"默认全开"意味着一次成功的诱导 = 整个硬盘。
+    #          "默认最小 + 按需提权"的差别在于：
+    #          攻击者要造成伤害，得先让用户同意提权，而提权看得见。
+    try:
+        import task_perms as _tp
+
+        _lv = _tp.get_level(task_name) if task_name else "workspace"
+        tools.set_level(_lv)
+        if _lv != "workspace":
+            prog.doing = f"权限：{_tp.LEVEL_LABEL.get(_lv, _lv)}"
+    except Exception:  # noqa: BLE001
+        tools.set_level("workspace")
 
     # 1) 接上历史
     stored = sess.load(workdir)
@@ -183,6 +204,30 @@ def run(task: str, workdir: str, llm: LLM, max_steps: int = 40,
     return prog
 
 
+def _tp_level() -> str:
+    """当前任务的权限级别。读不到就按最严的算。"""
+    try:
+        return tools.level()
+    except Exception:  # noqa: BLE001
+        return "workspace"
+
+
+def _count_block(what: str, reason: str) -> None:
+    """记一次拦截。计数的口径跟派活被拦是同一个。
+
+    为什么不分开记：
+        被拦了前台就知道出事了，她会去告诉用户，
+        不会自己换个说法再试。如果真的在同一个任务里反复重试，
+        那说明前台已经被绕过去了——这时候按次数算才对。
+    """
+    try:
+        import guard_gate as _g
+
+        _g.intercept(what, reason)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _check_action(name: str, arguments: str) -> str | None:
     """看一眼这个工具调用要不要拦。返回 None 表示放行。
 
@@ -210,12 +255,50 @@ def _check_action(name: str, arguments: str) -> str | None:
     # ── 跑命令：看命令本身 ──
     if name == "run_command":
         cmd = str(args.get("command") or "")
+
+        # 第一层：这个入口能不能执行任意代码？
+        #
+        # ⚠️ 这一层是千问打出来之后加的。
+        #
+        #    原来只有下面那层词表，他给 14 条载荷，9 条穿过去了：
+        #        python -c "import shutil; shutil.rmtree('D:/Project')"
+        #        node -e "require('fs').rmSync(...)"
+        #        powershell -enc ...
+        #        certutil ... && x.exe
+        #
+        #    他不是"漏了几个词"，是"词表管不住图灵完备的执行口"。
+        #    所以这一层质疑的不是命令内容，是**入口的表达能力**。
+        #    表达能力是有限的——就那几类解释器。
+        import task_perms as _tp
+
+        if _tp_level() != "full":
+            is_exec, label = ag.uses_arbitrary_executor(cmd)
+            if is_exec:
+                _count_block(cmd, label)
+                return ag.explain_executor(label)
+
+        # 第二层：直接写着的破坏性命令
         hits = ag.describe(cmd)
 
         reason = ""
         if hits:
             first = hits[0]
             reason = f"「{first['kind']}」——{first['why']}"
+
+        # 第三层：带路径的破坏（移动/清空）
+        #
+        # ⚠️ 这一类要看工作目录才知道算不算破坏。
+        #
+        #    在工作区里 mv a b 是日常操作，不该拦。
+        #    但 move D:/Project D:/_trash_xyz 是把整个项目挪走，
+        #    不可逆，而且动的是用户的真实文件。
+        #
+        #    一开始我把 mv 塞进词表，结果 mv a b 被误伤；
+        #    删掉之后又漏了那两条。所以这一类必须带工作目录判断。
+        if not reason:
+            hit = ag.destructive_move_or_truncate(cmd, tools.workdir())
+            if hit:
+                reason = f"「{hit['kind']}」——{hit['why']}"
         elif ag.touches_protected(cmd):
             reason = "要动的是我自己的安全配置"
 
@@ -264,12 +347,23 @@ def _check_action(name: str, arguments: str) -> str | None:
             path = os.path.join(workdir, path)
 
         if path and ag.is_outside(path, workdir):
-            # 越界写不算不可逆（用户可能就是要改自己别的项目），
-            # 但必须让它知道——不然用户回来发现文件被动了，找不到是谁干的。
-            return (
-                f"[提醒] 这个文件在任务目录外面：{path}\n"
-                f"已经照做了，但请在结果里告诉用户改了哪个文件。"
-            )
+            # ⚠️ 这里改过一次，而且改之前是**谎报**。
+            #
+            #    原来写的是：
+            #        "[提醒] 已经照做了，但请在结果里告诉用户"
+            #
+            #    但代码走到 return 之后是**跳过 tools.execute** —— 文件根本没写。
+            #    于是模型以为自己写了，可能跟用户说"我改了 xxx"，
+            #    用户去查发现没变。
+            #
+            #    谎报比不做更糟：用户会以为自己看到的是最新状态。
+            #
+            #    现在如实说：没写，问你。
+            import task_perms as _tp
+
+            if _tp_level() == "workspace":
+                _count_block(path, "写工作区外的文件")
+                return ag.explain_outside(path)
         return None
 
     return None

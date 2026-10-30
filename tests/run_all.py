@@ -53,6 +53,7 @@ def main() -> int:
         ("路径安全", "tests/test_safe_path.py"),
         ("危险操作验证码", "tests/test_guard.py"),
         ("动作级守卫", "tests/test_action_guard.py"),
+        ("实战 bug", "tests/test_field_bugs.py"),
         ("接口安全", "tests/test_security.py"),
         ("引擎核心", "tests/test_engine.py"),
         ("并发与调度", "tests/test_concurrency.py"),
@@ -109,6 +110,30 @@ def main() -> int:
         m = re.search(r"(\d+) failed", out)
         if m:
             total_fail += int(m.group(1))
+
+    # ── 暴力攻击测试 ──
+    #
+    # 单独跑，因为它不是 pytest 用例（是自己写的一个脚本）。
+    # 它打的是"挡不挡得住"，跟上面那些"功能对不对"是两回事。
+    print(f"\n{'─' * 66}")
+    print("  暴力攻击测试")
+    print(f"{'─' * 66}")
+
+    bf = os.path.join(ROOT, "tests", "brute_force.py")
+    if os.path.exists(bf):
+        r = subprocess.run(
+            [sys.executable, bf],
+            cwd=ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        for line in (r.stdout or "").splitlines():
+            if "结果：" in line or "失败清单" in line:
+                print(f"  {line.strip()}")
+        for line in (r.stdout or "").splitlines():
+            if line.strip().startswith("[绕过]") or line.strip().startswith("[误伤]"):
+                print(f"    {line.strip()}")
+        if r.returncode != 0:
+            failed_modules.append("暴力攻击")
 
     elapsed = time.time() - t0
 
