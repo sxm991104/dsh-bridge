@@ -281,7 +281,18 @@ def _build_args(command: str) -> list[str]:
         if parts:
             return parts
 
-    return ["cmd", "/c", command]
+    # ⚠️ 走 cmd 之前先切代码页到 UTF-8。
+    #
+    #    cmd.exe 的输出编码跟着代码页走（chcp 的原意就是这个）。
+    #    英文 Windows 的默认代码页是 cp1252，里面没有中文，
+    #    于是 `echo 中文` 在字节层面就已经变成 `????` 了——
+    #    后面的解码再怎么修都救不回来。
+    #
+    #    `chcp 65001 >nul` 把代码页切到 UTF-8，输出就是 UTF-8 字节。
+    #    `>nul` 是为了不把 "Active code page: 65001" 这行也吐给模型。
+    #
+    #    这一条也是 CI 打出来的：中文 Windows（936）上测不出来。
+    return ["cmd", "/c", "chcp 65001 >nul & " + command]
 
 
 def _split_command(command: str) -> list[str]:
@@ -537,6 +548,26 @@ def run_command(command: str, cwd: str = "", timeout: int = 120) -> str:
     # 让命令里能直接用 $WORKDIR / %WORKDIR%
     env = dict(os.environ)
     env["WORKDIR"] = work_dir
+
+    # ⚠️ 强制子进程用 UTF-8，不依赖系统代码页。
+    #
+    #    这一条是 CI 打出来的。Windows 的 GitHub runner 是英文环境，
+    #    默认代码页 cp1252。cp1252 里根本没有中文字符，
+    #    所以 `echo 中文测试` 出来是 `????`——**字节层面就已经丢了**，
+    #    后面再怎么解码都救不回来。
+    #
+    #    在中文 Windows 上（代码页 936）能过，所以本机一直没暴露。
+    #
+    #    三个变量一起设：
+    #        PYTHONIOENCODING          Python 子进程的 stdout/stderr
+    #        PYTHONUTF8                Python 子进程的文件编码
+    #        PYTHONLEGACYWINDOWSSTDIO  旧的 Windows stdio 行为，清掉
+    #
+    #    cmd.exe 本身不吃这些变量（它看代码页），
+    #    那部分在 _build_args 里用 chcp 65001 处理。
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env.pop("PYTHONLEGACYWINDOWSSTDIO", None)
 
     args = _build_args(command)
 
