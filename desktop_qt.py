@@ -1154,7 +1154,7 @@ class MainWindow(QMainWindow):
         self.nav_btns[0].setChecked(True)
 
         lay.addStretch()
-        ver = QLabel("v1.3.0")
+        ver = QLabel("v1.3.1")
         ver.setFont(font(10))
         ver.setStyleSheet(f"color:{C_DIM2}; padding:0 16px;")
         lay.addWidget(ver)

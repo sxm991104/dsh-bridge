@@ -370,3 +370,75 @@ def test_state_never_stuck() -> None:
 
     r = guard.check("无关任务")
     assert r["fenced"] is False, "锁满了还解锁不了"
+
+# ══════════════════════════════════════════════════════
+# J. 围栏必须拦住**所有**派活入口
+# ══════════════════════════════════════════════════════
+
+def test_dispatch_blocked_by_fence() -> None:
+    """★ 围栏开着时，cmd_dispatch 一条都不许放。
+
+    这是实测撞出来的漏洞：
+
+        原来的设计是"闸门装在前台插件的 send_to_computer 入口"，
+        想着不管模型走哪条路都拦得住。
+
+        但闸门只在插件那条路上。直接调 /api/dispatch，
+        或者走桥自己的命令行，都不检查围栏。
+
+        症状：发了验证码（全站该锁死），然后从别的路径派了一条，
+              created 和 started 只差 1 秒——**1 秒后就跑起来了**。
+    """
+    import bridge
+
+    # 先造围栏
+    danger = "删掉生产环境用户表"
+    _put(danger)
+    assert guard.check(danger)["fenced"] is True
+
+    # 从 dispatch 派——应该被拦
+    r = bridge.cmd_dispatch("随便什么活", "围栏测试任务")
+    assert r.get("status") == "blocked", f"竟然派出去了：{r}"
+    assert r.get("blocked") is True
+    assert r.get("error")
+
+
+def test_dispatch_blocks_normal_task_too() -> None:
+    """★ 普通任务也拦——围栏是全局的。"""
+    import bridge
+
+    _put("删库")
+
+    for txt in ("把按钮改大", "看看日志", "今天天气怎么样"):
+        r = bridge.cmd_dispatch(txt, f"围栏-{txt[:4]}")
+        assert r.get("status") == "blocked", f"「{txt}」漏过去了"
+
+
+def test_blocked_task_not_written() -> None:
+    """被拦的任务不能写进任务库。"""
+    import bridge
+
+    _put("删库")
+    before = len(bridge._read_tasks())
+
+    bridge.cmd_dispatch("不该被记录", "检查不落库")
+
+    after = bridge._read_tasks()
+    assert len(after) == before
+    assert not any(t.get("id") == "检查不落库" for t in after)
+
+
+def test_dispatch_works_after_unlock() -> None:
+    """验证通过后，dispatch 恢复正常。"""
+    import bridge
+
+    danger = "删库"
+    _put(danger, "888888")
+    guard.verify(danger, "888888")
+
+    r = bridge.cmd_dispatch("正常活", "解锁后测试")
+    assert r.get("status") == "pending", f"解锁了还派不出去：{r}"
+
+    # 清掉测试任务
+    tasks = [t for t in bridge._read_tasks() if t.get("id") != "解锁后测试"]
+    bridge._write_tasks(tasks)

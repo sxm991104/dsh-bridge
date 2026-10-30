@@ -1196,7 +1196,46 @@ def cmd_dispatch(task_text: str, task_id: str = "", profile: str = "") -> dict:
     profile 是"用哪套模型配置跑"。空的话用默认那套。
     多套配置是同时启用的，各自有并发额度——
     这套满了就排进这套的队列，不影响别套。
+
+    ⚠️ 这里要过安全闸。
+
+        原来的设计是"闸门装在前台插件的 send_to_computer 入口"，
+        想着不管模型走哪条路都拦得住。
+
+        但实际是个漏洞：**闸门只在插件那条路上。**
+        任何绕过插件的入口——直接调 /api/dispatch、
+        或者桥自己的命令行——都不检查围栏。
+
+        实测撞到过：昨天测试时发了验证码（全站该锁死），
+        然后从别的路径派了一条"被锁的活"，
+        它 created 14:51:29、started 14:51:30，**1 秒后就跑起来了**。
+        围栏形同虚设。
+
+        现在把检查放在 dispatch 本身：
+        不管从哪个入口进来，只要围栏开着就派不出去。
     """
+    # 安全闸：围栏开着就一条都不派。
+    try:
+        import guard as _g
+
+        # 用任务正文判断危险度；但**不管危不危险，
+        # 只要当前有围栏，就拒绝派活**。
+        _st = _g.check(task_text or "")
+        if _st.get("fenced"):
+            return {
+                "id": task_id or "",
+                "task": task_text,
+                "status": "blocked",
+                "error": f"任务端被安全锁拦着：{_st.get('reason') or '等待验证'}",
+                "fenced": True,
+                "blocked": True,
+            }
+    except Exception:  # noqa: BLE001
+        # guard 自己炸了不能因此放行所有活——
+        # 但也不能让桥彻底不能用。这里记一笔继续，
+        # 因为 guard 是安全增强，不是必经之路。
+        _log_quiet("guard 检查失败，放行本条")
+
     if not task_id:
         task_id = "t-" + datetime.now().strftime("%Y%m%d%H%M%S")
 

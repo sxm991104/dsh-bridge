@@ -1634,6 +1634,35 @@ def main() -> int:
 
     _API_TOKEN = _sec.load_or_create_token("dsh-bridge")
 
+    # 先把"上辈子"留下的烂摊子收拾掉。
+    #
+    # ⚠️ 为什么要做这个：
+    #     进程被强杀、机器断电、桥崩溃——这些情况下进程没了，
+    #     但 tasks.jsonl 里还写着 status="running"。
+    #     界面就一直转圈，用户以为它还在跑。
+    #
+    #     实测有一次一条任务从 10:51 挂到第二天，界面还显示"运行中"。
+    #     用户看到的是"被锁的活 运行中"——那条其实是另一条已取消的任务，
+    #     但底下这条真卡死的在列表里，看着就是没跑完。
+    try:
+        import bridge as _bridge
+        import recover as _recover
+
+        _fixed = _recover.recover(
+            workspaces=os.path.join(BRIDGE_DIR, "workspaces"),
+            read_tasks=_bridge._read_tasks,
+            write_tasks=_bridge._write_tasks,
+            now_iso=_bridge._now(),
+        )
+        if _fixed:
+            print(f"[api] 收回 {len(_fixed)} 条卡住的任务：")
+            for it in _fixed:
+                print(f"       {it['id']} —— {it['why']}")
+        else:
+            print("[api] 没有卡住的任务")
+    except Exception as e:  # noqa: BLE001
+        print(f"[api] 清理卡住任务失败（不影响启动）：{type(e).__name__}: {e}")
+
     # 起一个后台线程，定期把排队中的任务拉起来。
     #
     # 为什么放在接口服务里而不是桥里：
