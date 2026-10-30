@@ -55,6 +55,7 @@ def main() -> int:
         ("接口安全", "tests/test_security.py"),
         ("引擎核心", "tests/test_engine.py"),
         ("并发与调度", "tests/test_concurrency.py"),
+        ("产出文件", "tests/test_outputs.py"),
         ("压力测试", "tests/test_stress.py"),
     ]
 

@@ -1330,6 +1330,18 @@ def notify_outbox(task_id: str, rec: dict, task_text: str = "") -> None:
        用户派了活，跑挂了，什么都不说，只能自己去查。
 
        这个函数抽出来，让所有结束路径都能调。
+
+    ⚠️ 后来又加了一件事：**把产出的文件也记下来。**
+
+        原来推送只说「XXX 做完了」。如果这个活是"做一份报告"，
+        用户还得自己去电脑上翻到那个 docx。等于通知了，但没交货。
+
+        用户的原话：
+            「推送也只会告诉你完成了，完成的如果是可以传输的，
+              比如文档，图片之类的，应该也推送回来」
+
+        所以这里扫一遍任务的工作目录，把做出来的文件列进通知。
+        推送那边看到 files 字段就把它们一起发出去。
     """
     st = (rec or {}).get("status") or ""
     try:
@@ -1344,6 +1356,22 @@ def notify_outbox(task_id: str, rec: dict, task_text: str = "") -> None:
         except Exception:  # noqa: BLE001
             pass
 
+        # 扫产出文件。
+        #
+        # 只在任务成功的时候扫——失败的活目录里多半是半成品，
+        # 推回去反而让用户困惑（"这文件能不能用？"）。
+        files: list[dict] = []
+        skipped: list[dict] = []
+        if st == "ok":
+            try:
+                import outputs as _outputs
+
+                batch = _outputs.collect(_task_workdir(task_id))
+                files = batch.get("files") or []
+                skipped = batch.get("skipped") or []
+            except Exception as e:  # noqa: BLE001
+                _log_quiet(f"扫产出文件失败: {type(e).__name__}: {e}")
+
         note = {
             "id": task_id,
             "name": task_id,
@@ -1355,6 +1383,8 @@ def notify_outbox(task_id: str, rec: dict, task_text: str = "") -> None:
             "error": (rec or {}).get("error", "") or "",
             "seconds": (rec or {}).get("seconds"),
             "finished_at": (rec or {}).get("finished_at") or _now(),
+            "files": files,
+            "files_skipped": skipped,
             "delivered": False,
         }
         with open(OUTBOX, "a", encoding="utf-8") as f:
