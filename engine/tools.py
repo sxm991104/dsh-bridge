@@ -32,6 +32,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import stat
 import subprocess
 import sys
 
@@ -150,16 +151,29 @@ def _norm_for_check(path: str) -> str:
     #        或者某些备份工具会。所以这个判据在实际使用中几乎不误伤。
     try:
         st = os.stat(p)
-        if st.st_nlink > 1:
-            # ⚠️ 这里一开始写反了。
-            #
-            #    写成的是：nlink > 1 **并且** 不在允许范围 → 才拒。
-            #    但硬链接文件本身就在工作区里，is_allowed 返回 True，
-            #    所以永远不拒——测出来 0 通过 3 失败。
-            #
-            #    正确的判据是：**nlink > 1 本身就说明它在别处还有名字。**
-            #    那个名字我们控制不了，可能指向 C:\Windows 里的东西。
-            #    所以不管它看着在哪，一律拒。
+
+        # ⚠️ 只对**普通文件**做硬链接检查，不对目录做。
+        #
+        #    目录的 nlink 天然大于 1：
+        #        目录的 nlink = 2 + 子目录个数
+        #        （"." 算一个，".." 算一个，每多一个子目录 +1）
+        #
+        #    Linux 上 /tmp 这类目录 nlink 经常 ≥ 2，
+        #    所以不加这个判断的话，**每一个目录都会被当成硬链接拒掉**。
+        #
+        #    实测：CI 上跑，list_dir(".") 直接抛
+        #        PermissionError: 这个文件有另外的名字（硬链接）
+        #        真实内容可能在允许范围外：/tmp/tmppzk_tdk6
+        #
+        #    而本机（Windows）测不出来——Windows 上目录的 nlink 是 0，
+        #    永远不大于 1。这就是"本机全绿、CI 全红"的原因。
+        #
+        #    这是修 F-01 时自己引入的 bug：
+        #    当时的判断是"nlink > 1 就拒"，没区分文件和目录。
+        if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+            # 普通文件 nlink > 1 → 它在别处还有名字（硬链接）。
+            # 那个名字我们控制不了，可能指向 C:\Windows 里的东西。
+            # 所以不管它看着在哪，一律拒。
             raise PermissionError(
                 f"[权限不够] 这个文件有另外的名字（硬链接），"
                 f"真实内容可能在允许范围外：{p}\n"
