@@ -392,17 +392,18 @@ def save_config(cfg: dict) -> None:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     os.replace(tmp, p)
     # 这个文件里有授权码，收紧权限
+    #
+    # ⚠️ 原来直接调 icacls，在 Linux 上会 FileNotFoundError 被吞掉。
+    #    交给 platform_utils 统一处理。
     try:
-        import subprocess
+        import platform_utils as _pu
 
-        user = os.environ.get("USERNAME") or ""
-        if user:
-            subprocess.run(
-                ["icacls", p, "/inheritance:r", "/grant:r", f"{user}:F"],
-                capture_output=True, timeout=10,
-            )
-    except Exception:  # noqa: BLE001
-        pass
+        _pu.tighten_file(p)
+    except ImportError:
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
 
 
 def is_guard_ready() -> bool:

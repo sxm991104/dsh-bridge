@@ -241,12 +241,44 @@ def test_three_wrong_force_locks() -> None:
     assert r["can_resend"] is False, "强制锁期间竟然允许重发"
 
 
-def test_force_lock_blocks_resend() -> None:
-    """强制锁期间，发码请求要被拒。"""
+def test_force_lock_blocks_resend(monkeypatch) -> None:
+    """强制锁期间，发码请求要被拒。
+
+    ⚠️ 这条原来没打桩，直接调 send_code_email。
+
+        在开发者机器上能过（因为配了真实邮箱），
+        但在干净环境（CI、或者没配邮箱的机器）里，
+        send_code_email 第一步就返回"还没配安全邮箱"，
+        根本走不到锁检查那一步——于是断言 "锁" in msg 失败。
+
+        实测过一次：本机能过，CI 挂。
+
+        现在把发信打桩，让它一定走到"检查锁"那一步。
+    """
     danger = "删库"
     _put(danger, "999999")
     for _ in range(3):
         guard.verify(danger, "000000")
+
+    # ⚠️ 这里不打算桩 smtplib——send_code_email 里的发信是内联的，
+    #    没有单独的函数可以替换。
+    #
+    #    换个更实在的做法：给一个假邮箱配置。
+    #    这样 send_code_email 能走到"检查锁"那一步，
+    #    而真正的发信会因为连不上而失败——但那不影响我们测的东西：
+    #    我们要验的是"有锁的时候，它拒绝发"，不是"信能不能发出去"。
+    # is_guard_ready() 要三个条件同时成立：
+    #     enabled + email + smtp_host
+    # 少一个都会返回"还没配安全邮箱"，走到不去后面的锁检查。
+    cfg = guard.load_config()
+    if not guard.is_guard_ready():
+        cfg["enabled"] = True
+        cfg["email"] = "test@example.com"
+        cfg["smtp_host"] = "smtp.example.com"
+        cfg["smtp_port"] = 465
+        cfg["smtp_user"] = "test@example.com"
+        cfg["smtp_pass"] = "x" * 16
+        guard.save_config(cfg)
 
     ok, msg = guard.send_code_email(danger, "")
     assert ok is False

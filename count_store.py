@@ -238,26 +238,22 @@ def _load_key() -> bytes:
 
 
 def _tighten(path: str) -> None:
-    """把文件权限收紧到只有当前用户能读写。"""
-    if sys.platform != "win32":
+    """把文件权限收紧到只有当前用户能读写。
+
+    平台差异收在 platform_utils 里了：
+        Windows  icacls
+        Linux    chmod 600
+    """
+    try:
+        import platform_utils as _pu
+
+        _pu.tighten_file(path)
+    except ImportError:
+        # 单文件跑测试的时候可能拿不到这个模块，退回最保守的做法
         try:
             os.chmod(path, 0o600)
         except OSError:
             pass
-        return
-    try:
-        import subprocess
-
-        user = os.environ.get("USERNAME") or ""
-        if user:
-            subprocess.run(
-                ["icacls", path, "/inheritance:r", "/grant:r", f"{user}:F"],
-                capture_output=True,
-                timeout=10,
-                creationflags=0x08000000,
-            )
-    except Exception:  # noqa: BLE001
-        pass
 
 
 # ── 计数数据 ────────────────────────────────────────────

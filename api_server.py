@@ -1545,14 +1545,15 @@ class Handler(BaseHTTPRequestHandler):
 
             # 进程在、但端口不通 → 起了没登录，或者注入失败。
             # 这种情况不要重开进程，直接让界面去扫码。
+            #
+            # ⚠️ 原来直接调 tasklist（Windows 专用）。
+            #    而且只判了"有没有"，没判个数。
+            #    现在交给 platform_utils，两个平台都能查。
             try:
-                import subprocess as _sp
+                import platform_utils as _pu
 
-                cnt = _sp.run(
-                    ["tasklist", "/FI", "IMAGENAME eq QQ.exe", "/NH"],
-                    capture_output=True, timeout=10,
-                ).stdout.decode("utf-8", "replace").count("QQ.exe")
-            except Exception:  # noqa: BLE001
+                cnt = 1 if _pu.process_running("QQ") else 0
+            except ImportError:
                 cnt = 0
 
             if cnt > 0:
@@ -1647,6 +1648,26 @@ class Handler(BaseHTTPRequestHandler):
             #   3) 不能直接返回"正在重启"就完事。
             #      用户点完按钮得知道到底成没成，所以这里等
             #      3000 端口真的起来（或超时）再回话。
+            # ⚠️ 重启 QQ / NapCat 是 Windows 专属功能。
+            #
+            #    NapCat 靠往 QQ 进程里注入 DLL 工作，
+            #    而下面要调的 NapCatWinBootMain.exe 是 Windows 可执行文件，
+            #    taskkill / tasklist 也是 Windows 命令。
+            #
+            #    Linux 上这套东西根本不存在。与其"适配"，不如直接说清楚——
+            #    一个在 Linux 上假装能重启 QQ 的按钮，比没有这个按钮更糟。
+            import platform_utils as _pu_restart
+
+            if not _pu_restart.IS_WINDOWS:
+                return {
+                    "ok": False,
+                    "error": (
+                        "重启 QQ / NapCat 只能在 Windows 上用。"
+                        f"当前是 {_pu_restart.describe()}——"
+                        "这个平台上没有 NapCat 的注入宿主。"
+                    ),
+                }
+
             import paths as _p
 
             nap = _p.get("napcat_dir")

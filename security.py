@@ -82,20 +82,22 @@ def _restrict_to_me(path: str) -> None:
 
     Windows 上 %APPDATA% 本身就在用户目录下，默认继承的权限
     已经比较严了。这里再显式设一次，防止父目录权限被改松。
+
+    ⚠️ 原来这里直接调 icacls，没有平台判断。
+        在 Linux 上 icacls 不存在，subprocess 会抛 FileNotFoundError，
+        被 except 吞掉——不会崩，但等于什么都没做。
+
+        现在交给 platform_utils：Windows 走 icacls，Linux 走 chmod。
     """
     try:
-        import subprocess
+        import platform_utils as _pu
 
-        user = os.environ.get("USERNAME") or ""
-        if not user:
-            return
-        subprocess.run(
-            ["icacls", path, "/inheritance:r",
-             "/grant:r", f"{user}:F"],
-            capture_output=True, timeout=10,
-        )
-    except Exception:  # noqa: BLE001
-        pass
+        _pu.tighten_file(path)
+    except ImportError:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
 
 def is_local_address(addr: str) -> bool:
