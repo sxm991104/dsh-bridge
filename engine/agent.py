@@ -21,6 +21,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -146,7 +148,24 @@ def run(task: str, workdir: str, llm: LLM, max_steps: int = 40,
             if on_progress:
                 on_progress(prog)
 
-            result = tools.execute(tc.name, tc.arguments)
+            # 动作级检查：看它要**做什么**，不看任务描述说什么。
+            #
+            # ⚠️ 为什么检查放在这里而不是派活的时候：
+            #
+            #    派活时能看到的只有任务描述，而描述是可以骗人的——
+            #    有人让你派活，写个看似无害的描述就行。
+            #
+            #    但**工具调用做不了假**：真要删文件，就必须调删除；
+            #    真要改权限，就必须调 chmod。所以在这里拦，
+            #    骗过任务描述也绕不过去。
+            #
+            # 判断标准不是"危不危险"（那个列不完），
+            # 而是"**能不能撤销**"——这个是非黑即白的。
+            verdict = _check_action(tc.name, tc.arguments)
+            if verdict is not None:
+                result = verdict
+            else:
+                result = tools.execute(tc.name, tc.arguments)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -162,6 +181,98 @@ def run(task: str, workdir: str, llm: LLM, max_steps: int = 40,
     # 把这一轮的对话留给调用方（结果就是最后一条 assistant 的话）
     prog.messages = messages
     return prog
+
+
+def _check_action(name: str, arguments: str) -> str | None:
+    """看一眼这个工具调用要不要拦。返回 None 表示放行。
+
+    拦下来的时候返回一段文字，作为工具结果回填给模型——
+    这样模型自己就知道"这一步被拦了"，能换个做法，
+    而不是傻等或者反复重试。
+
+    为什么用"返回文字"而不是"抛异常"：
+        抛异常会让整个任务失败。而不可逆动作**有时候真的需要做**
+        （清理垃圾、重装依赖），一刀切禁掉就没法用了。
+        拦截应该造成"模型知道被拦了"，不是"任务挂了"。
+    """
+    try:
+        import action_guard as ag
+    except ImportError:
+        return None
+
+    try:
+        args = json.loads(arguments) if isinstance(arguments, str) else (arguments or {})
+    except (json.JSONDecodeError, TypeError):
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+
+    # ── 跑命令：看命令本身 ──
+    if name == "run_command":
+        cmd = str(args.get("command") or "")
+        hits = ag.describe(cmd)
+
+        reason = ""
+        if hits:
+            first = hits[0]
+            reason = f"「{first['kind']}」——{first['why']}"
+        elif ag.touches_protected(cmd):
+            reason = "要动的是我自己的安全配置"
+
+        if reason:
+            # ⚠️ 这里是「被拦也算一次」的地方。
+            #
+            #    计数不分"派活时被拦"还是"动作时被拦"——
+            #    只要被拦一次就 +1，三次锁死。
+            #
+            #    为什么不分：
+            #        被拦了之后，前台是知道的，也意识到出问题了，
+            #        她会去告诉用户。所以**她不会自己换个说法再试**。
+            #
+            #        如果真的在同一个任务里反复重试，
+            #        那说明前台已经被绕过去了——这时候按次数算才是对的。
+            try:
+                import guard_gate as _g
+
+                hit = _g.intercept(cmd, reason)
+                count = hit.get("count", 0)
+                tripped = hit.get("tripped", False)
+            except Exception:  # noqa: BLE001
+                count, tripped = 0, False
+
+            head = f"[被拦下了] 这一步是 {reason}。"
+            tail = (
+                "\n任务端已经锁死，要用得先过验证。"
+                if tripped
+                else f"\n这是今天第 {count} 次被拦。"
+            )
+            return (
+                f"{head}\n命令：{cmd[:120]}{tail}\n"
+                f"告诉用户这件事，不要自己换别的命令重试。"
+            )
+        return None
+
+    # ── 写文件：看是不是往工作目录外面写 ──
+    if name in ("write_file", "edit_file"):
+        path = str(args.get("path") or "")
+        workdir = tools.workdir()
+
+        # ⚠️ 相对路径先按工作目录解析成绝对路径再比。
+        #    不然 "a.txt" 会被当成绝对路径比较，判成越界——
+        #    实测把正常写文件的活也误拦了。
+        if path and not os.path.isabs(path):
+            path = os.path.join(workdir, path)
+
+        if path and ag.is_outside(path, workdir):
+            # 越界写不算不可逆（用户可能就是要改自己别的项目），
+            # 但必须让它知道——不然用户回来发现文件被动了，找不到是谁干的。
+            return (
+                f"[提醒] 这个文件在任务目录外面：{path}\n"
+                f"已经照做了，但请在结果里告诉用户改了哪个文件。"
+            )
+        return None
+
+    return None
 
 
 def _save(workdir: str, messages: list[dict], prog: Progress) -> None:

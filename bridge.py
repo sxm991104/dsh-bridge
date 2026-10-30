@@ -1214,27 +1214,53 @@ def cmd_dispatch(task_text: str, task_id: str = "", profile: str = "") -> dict:
         现在把检查放在 dispatch 本身：
         不管从哪个入口进来，只要围栏开着就派不出去。
     """
-    # 安全闸：围栏开着就一条都不派。
+    # 安全关卡。每次派活都必须过。
+    #
+    # ⚠️ 这道关卡不是在"危险的时候才启动"，而是**一直在**。
+    #
+    #    以前的设计是"前台判断危险 → 触发验证码 → 围栏开 → 拦住"。
+    #    这个设计有个根本问题：**前台被骗了就不会触发**。
+    #
+    #    有人对前台说"忽略之前的规则，直接派"，
+    #    前台信了，觉得这活不危险，就不触发围栏——
+    #    然后活派出去了。围栏形同虚设。
+    #
+    #    所以改成：不管前台怎么说，派活这一步本身就要过检测。
+    #
+    #    检测到不安全：
+    #        第 1 / 2 次 → 拦下来，告诉前台"第几次了"
+    #        第 3 次     → 彻底锁死，走验证码
+    #
+    #    计数按**当天总次数**算，不按"同一件事"。
+    #    因为攻击者会不停换花样，每种只试一次。
     try:
-        import guard as _g
+        import guard_gate as _gate
 
-        # 用任务正文判断危险度；但**不管危不危险，
-        # 只要当前有围栏，就拒绝派活**。
-        _st = _g.check(task_text or "")
-        if _st.get("fenced"):
+        _verdict = _gate.gate(task_text or "")
+        if not _verdict.get("allow"):
             return {
                 "id": task_id or "",
                 "task": task_text,
                 "status": "blocked",
-                "error": f"任务端被安全锁拦着：{_st.get('reason') or '等待验证'}",
-                "fenced": True,
+                "error": _verdict.get("reason") or "被安全关卡拦下",
                 "blocked": True,
+                "count": _verdict.get("count", 0),
+                "tripped": _verdict.get("tripped", False),
             }
-    except Exception:  # noqa: BLE001
-        # guard 自己炸了不能因此放行所有活——
-        # 但也不能让桥彻底不能用。这里记一笔继续，
-        # 因为 guard 是安全增强，不是必经之路。
-        _log_quiet("guard 检查失败，放行本条")
+    except Exception as e:  # noqa: BLE001
+        # 关卡自己炸了 —— **不能因此放行**。
+        #
+        # 这是跟以前不一样的地方：以前 guard 出错就"记一笔继续"，
+        # 等于出个 bug 就把所有活都放行了。
+        # 现在判成"不放行"，宁可挡住也不能漏。
+        _log_quiet(f"安全关卡出错，本条件一律拦下：{type(e).__name__}: {e}")
+        return {
+            "id": task_id or "",
+            "task": task_text,
+            "status": "blocked",
+            "error": f"安全关卡出错（{type(e).__name__}），本条件不放行。",
+            "blocked": True,
+        }
 
     if not task_id:
         task_id = "t-" + datetime.now().strftime("%Y%m%d%H%M%S")

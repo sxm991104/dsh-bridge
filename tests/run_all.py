@@ -52,6 +52,7 @@ def main() -> int:
     modules = [
         ("路径安全", "tests/test_safe_path.py"),
         ("危险操作验证码", "tests/test_guard.py"),
+        ("动作级守卫", "tests/test_action_guard.py"),
         ("接口安全", "tests/test_security.py"),
         ("引擎核心", "tests/test_engine.py"),
         ("并发与调度", "tests/test_concurrency.py"),
