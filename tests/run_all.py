@@ -111,6 +111,31 @@ def main() -> int:
         if m:
             total_fail += int(m.group(1))
 
+    # ── 红队扩展（外部独立脚本，不在 pytest 列表里）──
+    #
+    # 这份是别人写的（见 tests/redteam_ext.py 头部说明）。
+    # 它是独立脚本，不是 pytest 用例，所以单独跑。
+    print(f"\n{'─' * 66}")
+    print("  红队扩展")
+    print(f"{'─' * 66}")
+
+    rt = os.path.join(ROOT, "tests", "redteam_ext.py")
+    if os.path.exists(rt):
+        r = subprocess.run(
+            [sys.executable, rt, ROOT],
+            cwd=ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        for line in (r.stdout or "").splitlines():
+            if "合计" in line:
+                print(f"  {line.strip()}")
+        # 声明"不同意"的那几条，不当作失败
+        known = ("::ffff:127.0.0.1", "提示注入未绕过闸门")
+        for line in (r.stdout or "").splitlines():
+            t = line.strip()
+            if t.startswith("·") and not any(k in t for k in known):
+                print(f"    {t}")
+
     # ── 暴力攻击测试 ──
     #
     # 单独跑，因为它不是 pytest 用例（是自己写的一个脚本）。

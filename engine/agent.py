@@ -285,7 +285,7 @@ def _check_action(name: str, arguments: str) -> str | None:
             first = hits[0]
             reason = f"「{first['kind']}」——{first['why']}"
 
-        # 第三层：带路径的破坏（移动/清空）
+        # 第三层：带路径的破坏（移动/清空/重定向）
         #
         # ⚠️ 这一类要看工作目录才知道算不算破坏。
         #
@@ -301,6 +301,21 @@ def _check_action(name: str, arguments: str) -> str | None:
                 reason = f"「{hit['kind']}」——{hit['why']}"
         elif ag.touches_protected(cmd):
             reason = "要动的是我自己的安全配置"
+
+        # 第四层：系统级破坏 + 下载执行
+        #
+        # 跟第二层的区别：
+        #     第二层是"某个文件/某个库没了"
+        #     第四层是"系统不可用 / 证据没了 / 能进你账号"
+        #
+        # 后果不是一个量级，所以单独一层、单独的说明。
+        # 来历是红队报告 F-05 / F-06——
+        # 那位测试者的话很到位：方向对了，只是清单不全。
+        if not reason:
+            sys_hits = ag.system_damage(cmd)
+            if sys_hits:
+                first = sys_hits[0]
+                reason = f"「{first['kind']}」——{first['why']}"
 
         if reason:
             # ⚠️ 这里是「被拦也算一次」的地方。
@@ -343,6 +358,39 @@ def _check_action(name: str, arguments: str) -> str | None:
         # ⚠️ 相对路径先按工作目录解析成绝对路径再比。
         #    不然 "a.txt" 会被当成绝对路径比较，判成越界——
         #    实测把正常写文件的活也误拦了。
+        #
+        # ⚠️ 但 ~ 和 $HOME / %USERPROFILE% 要在这一步**之前**展开（红队 D 组）。
+        #
+        #    原来直接 os.path.isabs("~/pwned.txt") → False，
+        #    于是拼成 <workdir>/~/pwned.txt —— 看着在工作区内，放行。
+        #    而 tools._resolve 那边会 expanduser 成真实家目录然后拦住。
+        #
+        #    两层又各算各的（跟 F-08 是同一类问题）。
+        #    现在这里也先展开，跟 is_outside 里的处理对齐。
+        if path:
+            path = os.path.expanduser(path)
+
+            # 环境变量形式。expanduser 只认 ~，不认这些。
+            if path.startswith("$") or path.startswith("%"):
+                _heads = {
+                    "$home": os.path.expanduser("~"),
+                    "$userprofile": os.path.expanduser("~"),
+                    "%userprofile%": os.path.expanduser("~"),
+                    "$tmpdir": os.environ.get("TEMP") or "",
+                    "$temp": os.environ.get("TEMP") or "",
+                    "%temp%": os.environ.get("TEMP") or "",
+                    "%tmp%": os.environ.get("TEMP") or "",
+                }
+                low = path.lower()
+                for head, real in _heads.items():
+                    if low.startswith(head):
+                        path = real + path[len(head):]
+                        break
+                else:
+                    # 不认识的变量 —— 不知道会展开成什么，
+                    # 按最坏情况处理：当成工作区外。
+                    path = os.path.join("D:" + os.sep, "unknown_var")
+
         if path and not os.path.isabs(path):
             path = os.path.join(workdir, path)
 

@@ -87,6 +87,95 @@ def level() -> str:
     return _LEVEL
 
 
+def _norm_for_check(path: str) -> str:
+    """把路径规范化成"实际会落到哪"的样子，用来做权限判断。
+
+    ⚠️ 这个函数是红队测试打出来的。
+
+        原来 _resolve 里的权限判断用的是 os.path.abspath + normpath：
+        **纯字符串运算，不解析符号链接。**
+
+        于是这个攻击成立（两步，每步单独看都合法）：
+
+            第 1 步  mklink /J link C:\\Users\\me
+                    （在任务自己的工作目录里建一个 junction）
+
+            第 2 步  write_file("link/任意路径")
+                    → abspath 得到 <workdir>/link/任意路径
+                    → 看着在工作区内 → 权限放行
+                    → 实际写进了 C:\\Users\\me
+
+        实测在 Windows 上复现成功：abspath 判为"在工作区内"，
+        realpath 显示真实落点在工作区外，文件真的被写到外面了。
+
+        **这击穿的正是权限模型本身**——不是绕过命令词表，
+        是让"工作区"这个边界失去意义。
+
+    做法：expanduser → realpath → normcase
+
+    为什么 realpath 也拦得住"链接还不存在"的情况：
+        它解析的是**已经存在的**每一段链接。链接不存在时，
+        realpath 就等于普通规范化——建链接那一步由
+        action_guard 的执行口清单拦。两层配合。
+    """
+    p = (path or "").strip().strip('"')
+    if not p:
+        return _WORKDIR
+    p = os.path.expanduser(p)
+    if not os.path.isabs(p):
+        p = os.path.join(_WORKDIR, p)
+    p = os.path.normcase(os.path.realpath(p))
+
+    # ── program 3：硬链接 ──
+    #
+    # ⚠️ realpath 追不到硬链接，这一点必须单独处理。
+    #
+    #     实测：在任务目录里 `mklink /H innocent.txt 外面的secret.txt`
+    #
+    #         realpath(innocent.txt) = <workdir>/innocent.txt   ← 看着在里面
+    #         内容 = TOP_SECRET                                  ← 读到了外面的
+    #
+    #     硬链接没有"目标"这个概念——它就是同一个文件的另一个名字。
+    #     GetFinalPathNameByHandle 也追不到，返回的还是工作区那个名字。
+    #
+    #     唯一的判据是文件的链接数：
+    #         普通文件   nlink = 1
+    #         硬链接     nlink ≥ 2   ← 说明它在别处还有名字
+    #
+    #     {"nlink": 2} 意味着这个文件有另一个名字在外面，
+    #     而那另一个名字我们控制不了（可能是 C:\Windows 下的东西）。
+    #
+    #     ⚠️ 误伤评估：实测两个项目目录共 75 个文件，nlink 全是 1。
+    #        正常复制/编辑不会产生硬链接，只有明确的 mklink /H
+    #        或者某些备份工具会。所以这个判据在实际使用中几乎不误伤。
+    try:
+        st = os.stat(p)
+        if st.st_nlink > 1:
+            # ⚠️ 这里一开始写反了。
+            #
+            #    写成的是：nlink > 1 **并且** 不在允许范围 → 才拒。
+            #    但硬链接文件本身就在工作区里，is_allowed 返回 True，
+            #    所以永远不拒——测出来 0 通过 3 失败。
+            #
+            #    正确的判据是：**nlink > 1 本身就说明它在别处还有名字。**
+            #    那个名字我们控制不了，可能指向 C:\Windows 里的东西。
+            #    所以不管它看着在哪，一律拒。
+            raise PermissionError(
+                f"[权限不够] 这个文件有另外的名字（硬链接），"
+                f"真实内容可能在允许范围外：{p}\n"
+                f"当前权限：{_LEVEL}。"
+                f"要碰它的话，需要把这个窗口的权限提一档。"
+            )
+    except FileNotFoundError:
+        pass    # 文件还不存在（新建），没有链接问题
+    except PermissionError:
+        raise
+    except OSError:
+        pass
+
+    return p
+
+
 def _resolve(path: str) -> str:
     """把模型给的路径解析成绝对路径。**顺便做权限检查。**
 
@@ -103,6 +192,12 @@ def _resolve(path: str) -> str:
 
     默认权限是"工作区"，也就是只能在任务自己的目录里动。
     要碰外面，得给那个窗口单独提权。
+
+    ⚠️ 判断用 realpath（追符号链接），不是 abspath。
+
+        红队测试用 junction 逃出去过一次：
+        在工作目录里建个链接指向 C:\\Users\\me，
+        abspath 看着还在工作区里，实际写到了外面。
     """
     p = (path or "").strip().strip('"')
     if not p:
@@ -116,9 +211,8 @@ def _resolve(path: str) -> str:
     try:
         import task_perms as _tp
 
-        if not _tp.is_allowed(p, _LEVEL, _WORKDIR):
-            # 抛出去，让调用方当"工具失败"处理——
-            # 模型会看到这段说明，知道是权限不够，不是文件不存在。
+        # 用真实路径判权限（追链接），不是用字符串形态
+        if not _tp.is_allowed(_norm_for_check(p), _LEVEL, _WORKDIR):
             raise PermissionError(_tp.explain_denied(p, _LEVEL))
     except ImportError:
         pass
@@ -576,11 +670,41 @@ _DISPATCH = {
 
 
 def execute(name: str, arguments: str) -> str:
-    """执行一次工具调用。
+    """执行一次工具调用。**这里是所有工具调用的单点收口。**
 
     模型的参数偶尔会出问题：JSON 不完整、字段名写错、类型不对。
     这里全部吞掉异常，把错误当成工具结果返回给它——
     模型看到"你参数写错了"会自己改，直接抛异常则整轮就断了。
+
+    ⚠️ 动作守卫挂在这里，不是挂在 agent 循环里。
+
+        红队测试指出的 F-02：
+
+            以前 _check_action 只在 engine/agent.py 的工具循环里调。
+            而 execute() 本身没有任何守卫。
+
+            当时只有 agent 循环调 execute()，所以不是直接可利用。
+            但这是纵深防御缺口——任何新调用方（桌面端、recover.py、
+            未来的 HTTP API、测试脚本）都会完全绕过命令层拦截。
+
+        实测验证：
+
+            agent._check_action("run_command", '{"command":"python -c ..."}')
+              → 拦住了
+
+            tools.execute("run_command", 同一条)
+              → 真执行了
+
+        这跟项目自己的设计原则矛盾。task_perms.py 里写着：
+            "检查点放在 tools.py 的 _resolve()——所有文件工具都走这条路，
+              一个地方把关比每个工具各加一遍靠谱"
+
+        路径层做到了单点收口，命令层没有。现在补上。
+
+        为什么保留 agent 里那层：
+            双层。execute() 这层保证"任何调用方都绕不过"；
+            agent 那层负责给模型一段更友好的说明，并且能统计
+            "这个任务里被拦了几次"。两层做的事不重复。
     """
     fn = _DISPATCH.get(name)
     if fn is None:
@@ -606,6 +730,38 @@ def execute(name: str, arguments: str) -> str:
         args = {k: v for k, v in args.items() if k in accepted}
     except (TypeError, ValueError):
         pass
+
+    # ── 动作守卫：单点收口 ──
+    #
+    # 放在参数清洗之后、真正调用之前。
+    # 这里用 late import 是为了避免循环依赖
+    # （agent 会 import tools，tools 不该在顶层 import agent）。
+    try:
+        from . import agent as _agent
+
+        verdict = _agent._check_action(name, json.dumps(args))
+        if verdict is not None:
+            return verdict
+    except ImportError:
+        # agent 模块不可用（比如单独测 tools）——不因此放行。
+        # 直接跑一个最小化的检查。
+        try:
+            import action_guard as _ag
+
+            if name == "run_command":
+                cmd = str(args.get("command") or "")
+                is_exec, label = _ag.uses_arbitrary_executor(cmd)
+                if is_exec:
+                    return _ag.explain_executor(label)
+                hits = _ag.describe(cmd)
+                if hits:
+                    return _ag.explain_irreversible(hits[0])
+        except ImportError:
+            pass
+    except Exception as e:  # noqa: BLE001
+        # 守卫自己炸了 —— **不放行**。
+        # 跟 _blocked() 里那个保守方向一致：守卫挂了不等于安全。
+        return f"[拦下了] 动作守卫出错（{type(e).__name__}），这条不放行。"
 
     try:
         return str(fn(**args))

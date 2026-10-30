@@ -35,6 +35,26 @@ def _reset() -> None:
     guard._force_locked.clear()
     guard._verified.clear()
 
+    # ⚠️ 还要清"今天被拦了几次"。
+    #
+    #    这个计数是持久化的（count_store 写文件），
+    #    不清的话会跨测试累积。
+    #
+    #    实测：跑完整套 test_guard 之后计数累积到 11，
+    #    于是最后那条"解锁后能派活"的测试被锁死了——
+    #    它测的是别的东西，但被前面测试留下的状态干掉了。
+    #
+    #    测试之间必须互不影响。
+    try:
+        import count_store
+
+        count_store.reset_count()
+        d = count_store.load()
+        d["tamper"] = 0
+        count_store.save(d)
+    except Exception:  # noqa: BLE001
+        pass
+
 
 @pytest.fixture(autouse=True)
 def clean_state():

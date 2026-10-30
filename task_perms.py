@@ -124,20 +124,42 @@ def allowed_roots(level: str, workdir: str) -> list[str]:
     return roots
 
 
+def _real(path: str) -> str:
+    """规范化成真实路径：展开 ~、追符号链接、统一大小写。
+
+    ⚠️ 为什么必须追链接：
+
+        红队测试用 junction 逃出过一次。工作目录里建
+        "link_out" 指向 C:\\Users\\me，然后写 "link_out/x.txt"。
+
+        abspath 得到 <workdir>/link_out/x.txt —— 看着在工作区内。
+        realpath 得到 C:\\Users\\me\\x.txt —— 实际在外面。
+
+        只用 abspath 判前缀，工作区边界就废了。
+    """
+    try:
+        return os.path.normcase(os.path.realpath(os.path.expanduser(path)))
+    except (OSError, ValueError):
+        return ""
+
+
 def is_allowed(path: str, level: str, workdir: str) -> bool:
-    """这个路径在当前权限下能不能碰。"""
+    """这个路径在当前权限下能不能碰。
+
+    ⚠️ 两边都用 realpath：
+        待判路径要追链接（不然顺着链接跑出去）；
+        允许的根目录也要追（用户目录本身可能就是链接）。
+    """
     if not path:
         return False
 
-    try:
-        target = os.path.normcase(os.path.abspath(path))
-    except (OSError, ValueError):
+    target = _real(path)
+    if not target:
         return False
 
     for root in allowed_roots(level, workdir):
-        try:
-            r = os.path.normcase(os.path.abspath(root))
-        except (OSError, ValueError):
+        r = _real(root)
+        if not r:
             continue
 
         # ⚠️ 根目录本身已经带分隔符了（"c:\\"），不能再补一个。

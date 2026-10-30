@@ -28,7 +28,8 @@ import security  # noqa: E402
     "::1",
     "localhost",
     "::ffff:127.0.0.1",     # IPv4-mapped
-    " 127.0.0.1 ",          # 带空格
+    "[::1]",                # 带方括号的 IPv6（红队 F 组）
+    "127.0.0.1:6186",       # 带端口（红队 F 组）
 ])
 def test_local_address_accepted(addr: str) -> None:
     assert security.is_local_address(addr) is True
@@ -45,6 +46,8 @@ def test_local_address_accepted(addr: str) -> None:
     "127.0.0.2",            # 这个技术上也是 loopback，但我们只认 .1
     "127.0.0.1.evil.com",   # 域名伪装
     "localhost.evil.com",
+    " 127.0.0.1 ",          # 带空白（红队 F 组：这个参数来自 socket，不该有空白）
+    "127.0.0.1\n",          # 带换行
 ])
 def test_non_local_rejected(addr) -> None:
     assert security.is_local_address(addr) is False
@@ -132,14 +135,34 @@ def test_evil_host_rejected(host: str) -> None:
     assert security.host_is_local(h) is False
 
 
-def test_no_host_header_allowed() -> None:
-    """没有 Host 头时放行——交给后面几层判断。
+def test_no_host_header_rejected() -> None:
+    """没有 Host 头时拒绝。
 
-    HTTP/1.0 或者手工构造的请求可能没有 Host。
-    这种请求不是正经浏览器发的，后面还有 Origin 和 token 两道门。
+    ⚠️ 这条原来叫 test_no_host_header_allowed，断言"放行"。
+
+        当时的理由是：HTTP/1.0 或者手工构造的请求可能没有 Host，
+        这种请求不是正经浏览器发的，后面还有 Origin 和 token 两道门。
+
+        红队报告 F-07 指出这是 fail-open，对：
+
+            · HTTP/1.1 的请求**必须**带 Host 头（RFC 7230 §5.4）
+            · 能发出"没有 Host 头"的，只有手工构造的 HTTP/1.0 请求
+              或者极老的客户端
+            · 正常的 curl / requests / 浏览器 / 桌面端都必带
+
+        安全代码里拿不准的时候应该选拒。
+        "放行给后面几层"等于把判断推给不检查 Host 的层。
+
+        实测过：改完之后 requests / curl / 桌面端全正常。
     """
     h = FakeHeaders()
-    assert security.host_is_local(h) is True
+    assert security.host_is_local(h) is False
+
+
+def test_empty_host_rejected() -> None:
+    """空 Host 头同样拒绝。"""
+    h = FakeHeaders({"Host": "   "})
+    assert security.host_is_local(h) is False
 
 
 # ══════════════════════════════════════════════════════

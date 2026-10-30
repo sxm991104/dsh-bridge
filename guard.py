@@ -175,13 +175,36 @@ def _expire_pending(fp: str) -> None:
 
 
 def lock_remaining(task: str) -> int:
-    """这个任务还要锁多少秒。0 表示没锁。"""
+    """这个任务还要锁多少秒。0 表示没锁。
+
+    ⚠️ 要同时看两种锁。红队报告 F-09 指出的就是这个。
+
+        原来只查 _locked（"验证码过期后还要锁 10 分钟"那种）。
+        但还有 _force_locked —— "被拦满三次、任务端锁死"的那种。
+
+        后果：is_fenced() 调的是这个函数，于是"被拦满三次锁死之后，
+        is_fenced 却说没被关着"。
+
+        派活那条路本身安全（cmd_dispatch 里单独查了 _force_locked），
+        所以不是直接可利用的漏洞。但一个叫"还剩多少秒"的函数
+        不知道最重的那种锁，迟早有人在别处用它做判断。
+
+        现在两种锁取大的那个。
+    """
     fp = _fingerprint(task)
 
     # 先看看有没有过期的码要处理
     p = _state.pending.get(fp)
     if p is not None and p.expires < time.time():
         _expire_pending(fp)
+
+    # 任务端级强制锁（被拦满三次那种）
+    force_until = _force_locked.get(fp)
+    if force_until is None:
+        force_until = _force_locked.get("_all")
+    force_left = int((force_until or 0) - time.time())
+    if force_left > 0:
+        return force_left
 
     until = _locked.get(fp)
     if until is None:
@@ -572,7 +595,26 @@ def verify(task: str, code: str, who: str = "") -> tuple[bool, str]:
         return False, "没有待验证的操作（可能过期了，重新发起一次）"
 
     if p.expires < now:
+        # ⚠️ 这里原来只删 pending，**没有上锁**。
+        #
+        #    红队 G 组打出来的：
+        #        注入一个过期码 → verify 返回"过期了" → 删掉 pending
+        #        → lock_remaining 返回 0（没锁）
+        #
+        #    而同一个文件里 _expire_pending() 做的事是：
+        #        删 pending + 锁 LOCK_AFTER_EXPIRE
+        #
+        #    两处逻辑不一致。设计意图很清楚（LOCK_AFTER_EXPIRE
+        #    这个常量的存在就说明了）：过期之后要锁一段时间，
+        #    不让立刻重发。
+        #
+        #    实测：走 verify 这条路过期不锁，等于"码过期了马上就能
+        #    要一个新的"——攻击者可以让码不停过期、不停重发，
+        #    每一次重发都是一次新的猜测机会。
+        #
+        #    现在跟 _expire_pending 对齐。
         _state.pending.pop(fp, None)
+        _locked[fp] = now + LOCK_AFTER_EXPIRE
         return False, "验证码过期了"
 
     if p.tries >= MAX_TRIES:

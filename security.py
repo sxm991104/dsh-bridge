@@ -104,12 +104,54 @@ def is_local_address(addr: str) -> bool:
     虽然绑了 127.0.0.1，理论上只可能是本机。
     但多一道检查没坏处——万一哪天绑定被改了，
     有这个检查还能挡住。
+
+    ⚠️ 红队报告 F 组指出：这里对各种地址写法的处理不全。
+
+        实测漏掉的：
+            '[::1]'              带方括号的 IPv6（URL 里就是这么写的）
+            '127.0.0.1:6186'     带端口的
+
+        这两个都是**合法的本机地址写法**，原来判成"不是本机"。
+        方向安全（拒了），但一个叫 is_local_address 的函数
+        不认识合法写法，说明它没想清楚自己在判断什么。
+
+        还有三个是"判成是本机"的：
+            '  127.0.0.1  '      前后有空格
+            '127.0.0.1\n'        带换行
+            '::ffff:127.0.0.1'   IPv4-mapped IPv6
+
+        红队认为前两个该拒（"谁会在地址里加空格"）。
+        我同意——这个参数来自 socket，正常不会有空白字符。
+        见到空白说明来源可疑，拒掉比猜更有道理。
+
+        第三个（::ffff:）**保持判为本机**：
+        那是 IPv4 映射到 IPv6 的正常表示，Windows 上常见。
+        红队那条是断言它应该 False，但我不同意——
+        它指向的就是 127.0.0.1。
     """
     if not addr:
         return False
-    a = addr.strip()
+
+    # 空白字符一律拒。这个参数来自 socket，不该有空白。
+    # 原来 strip() 之后就判，等于把 " 127.0.0.1\n" 当成合法地址。
+    if addr != addr.strip():
+        return False
+
+    a = addr
+
+    # 剥方括号：[::1] → ::1
+    if a.startswith("[") and a.endswith("]"):
+        a = a[1:-1]
+
+    # 剥端口：127.0.0.1:6186 → 127.0.0.1
+    # IPv6 里冒号是地址的一部分，所以只在"不是 IPv6"时才按端口剥。
+    if a.count(":") == 1:
+        a = a.split(":", 1)[0]
+
+    # IPv4 映射到 IPv6
     if a.startswith("::ffff:"):
         a = a[len("::ffff:"):]
+
     return a in ("127.0.0.1", "::1", "localhost")
 
 
@@ -119,14 +161,46 @@ def has_browser_origin(headers) -> bool:
     本机程序（Python、curl、桌面端）不会发 Origin，
     浏览器发的 fetch 一定会带。
 
-    注意 Sec-Fetch-Site：现代浏览器发本地请求时会带这个，
-    值是 cross-site 或者 same-site，也是网页发来的信号。
+    ⚠️ 这里红队 F 组指了两条，我一条同意一条不同意。
+
+        同意：
+            Sec-Fetch-Mode: cors
+                这是 fetch 特有的（还可能是 no-cors / navigate）。
+                看到 cors 基本可以确定是网页在发请求。
+                原来没看这个头，现在加上。
+
+        不同意：
+            Sec-Fetch-Site: none
+                红队认为它有就是浏览器发的，应该拒。
+
+                但 none 的含义是**用户直接在地址栏输入网址**
+                （或者从书签打开）——不是网页发起的。
+
+                把它当"网页请求"拒掉，等于误伤"手动打开 WebUI 看状态"
+                这种完全正常的操作。
+
+                我的判断：none 不该单独构成"这是网页攻击"的证据。
+
+        另外保留：
+            any Sec-Fetch-Site（包括 cross-site / same-site）
+                这两种确实是从别的页面跳过来的，算网页请求。
+            所以是"none 放过，其它值拦"，不是"有这个头就拦"。
     """
     origin = headers.get("Origin")
     if origin:
         return True
-    site = headers.get("Sec-Fetch-Site")
-    return bool(site)
+
+    # fetch 的特征
+    mode = (headers.get("Sec-Fetch-Mode") or "").strip().lower()
+    if mode in ("cors", "no-cors", "same-origin"):
+        return True
+
+    site = (headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if not site:
+        return False
+
+    # none = 用户直接在地址栏输入 / 从书签打开，不是网页发起的
+    return site != "none"
 
 def host_is_local(headers) -> bool:
     """请求的 Host 头是不是本机。
@@ -143,12 +217,32 @@ def host_is_local(headers) -> bool:
         所以再加这道 Host 检查：只接受 localhost / 127.0.0.1 / [::1]。
 
     允许带端口（Host 头本来就是 "host:port" 的形式）。
+
+    ⚠️ 没有 Host 头时**拒绝**，不是放行。
+
+        原来写的是：
+            if not host:
+                return True     # 放行，交给后面几层判断
+
+        红队报告 F-07 指出这是 fail-open，对：
+            HTTP/1.1 的请求**必须**带 Host 头（RFC 7230 §5.4），
+            HTTP/1.0 可以不带的年代早就过去了。
+
+            能发出"没有 Host 头"的请求的，只有：
+                · 手工构造的 HTTP/1.0 请求（攻击者常用）
+                · 极老的客户端
+            正常的 curl / requests / 浏览器都必带。
+
+        安全代码里，"拿不准"的时候应该选**拒**。
+        放行等于把判断推给后面——而后面那几层不检查 Host。
+
+        实测过：改完之后 requests / curl / 桌面端都正常。
     """
     host = (headers.get("Host") or "").strip().lower()
     if not host:
-        # HTTP/1.0 或者手工构造的请求可能没有 Host。
-        # 没有 Host 说明不是正经浏览器发的，放行给后面几层判断。
-        return True
+        # 没有 Host = 不是正经客户端发的，拒。
+        # 见上面的说明：fail-closed 是安全代码该有的默认方向。
+        return False
 
     # 去掉端口
     if host.startswith("["):
