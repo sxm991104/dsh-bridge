@@ -339,19 +339,50 @@ def main() -> int:
     except PermissionError:
         expect("write_file 越界写", True, True)
 
-    # 各种路径变形
-    for label, path in [
+    # ── 各种路径变形 ──
+    #
+    # ⚠️ 这里要分平台，因为"什么算路径"不一样。
+    #
+    #    有人拉下来在 Linux 上跑，报了 3 条失败：
+    #        ..\outside.txt
+    #        C:\Windows\evil.txt
+    #        ..\../outside.txt
+    #
+    #    他核对了，那 3 条不是漏洞——
+    #    在 POSIX 上反斜杠**不是路径分隔符**，所以
+    #    "..\outside.txt" 只是个普通文件名，落在工作目录里，
+    #    判成"没越界"是对的。
+    #
+    #    而在 Windows 上它就是上级目录，必须拦住。
+    #
+    #    所以：Windows 专属的变形只在 Windows 上断言。
+
+    common = [
         ("上级目录", "../outside.txt"),
         ("多级上级", "../../../outside.txt"),
-        ("反斜杠上级", "..\\outside.txt"),
         ("绝对路径", os.path.join(_TMP, "outside.txt")),
+    ]
+    windows_only = [
+        ("反斜杠上级", "..\\outside.txt"),
         ("盘符跳转", r"C:\Windows\evil.txt"),
         ("混用分隔符", "..\\../outside.txt"),
-    ]:
+    ]
+
+    for label, path in common:
         must_block(
             f"write_file {label}", "write_file",
             {"path": path, "content": "x"},
         )
+
+    if sys.platform == "win32":
+        for label, path in windows_only:
+            must_block(
+                f"write_file {label}", "write_file",
+                {"path": path, "content": "x"},
+            )
+    else:
+        print("  ⏭  反斜杠相关的 3 条只在 Windows 上测"
+              "（POSIX 上反斜杠不是分隔符）")
 
     print("\n" + "=" * 74)
     print("六、权限")

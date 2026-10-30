@@ -320,17 +320,63 @@ def touches_protected(command: str) -> bool:
 # ══════════════════════════════════════════════════════
 
 def is_outside(path: str, workdir: str) -> bool:
-    """这个路径在任务工作目录外面吗。"""
+    """这个路径在任务工作目录外面吗。
+
+    ⚠️ 这里有个跨平台的坑。
+
+        有人拉下来在 Linux 上跑测试，报了 "echo. > D:/important.txt"
+        没被拦住，以为真漏了。
+
+            在 Windows 上    D:/ 是绝对路径 → 在工作区外 → 拦
+            在 Linux 上      D:/ 只是普通文件名 → 当成 <workdir>/D:/...
+                            → 判成"在工作区内" → 不拦
+
+        差异不在安全逻辑，在"谁在解析这个字符串"。
+
+        要紧的是：**这条命令最终在哪执行、按哪个平台的规则解析。**
+        这个项目主要跑 Windows，任务端也是 Windows，
+        所以看到盘符就按 Windows 规则判——哪怕测试跑在 Linux 上。
+
+        纯相对路径（../xxx）则按当前平台解析，那个两边一致。
+    """
     if not path or not workdir:
         return False
+
     try:
-        p = os.path.normcase(os.path.abspath(path))
-        w = os.path.normcase(os.path.abspath(workdir))
-        if p == w:
-            return False
-        if not w.endswith(os.sep):
-            w = w + os.sep
-        return not p.startswith(w)
+        w = os.path.normcase(os.path.abspath(workdir)).replace("\\", "/")
+        if not w.endswith("/"):
+            w = w + "/"
+
+        # "看着就是绝对路径"的几种形态：盘符、UNC、开头的斜杠、~
+        # 这些不管在哪个系统上执行，都是跑到别处去了。
+        p_raw = path.replace("\\", "/")
+        looks_absolute = bool(
+            re.match(r"^[a-zA-Z]:/", p_raw)
+            or p_raw.startswith("//")
+            or p_raw.startswith("/")
+            or p_raw.startswith("~")
+        )
+
+        if looks_absolute:
+            p = os.path.normcase(os.path.normpath(p_raw)).replace("\\", "/")
+            return not p.startswith(w)
+
+        # 普通相对路径：**相对工作目录**解析，不是相对进程的 cwd。
+        #
+        # ⚠️ 这里踩过一次：第一版用的是 os.path.abspath(path)，
+        #    而 abspath 按的是 Python 进程的当前目录（测试时是
+        #    仓库根目录），于是 "a.txt" 被解析成 <仓库>/a.txt，
+        #    跟任务工作目录完全不同 → 判成越界 → 每一条正常写都误伤。
+        #
+        #    相对路径的基准永远是任务的工作目录，这一点在
+        #    engine/tools.py 的 _resolve 里也是这样，两边要一致。
+        root = os.path.normcase(os.path.abspath(workdir))
+        if not root.endswith(os.sep):
+            root = root + os.sep
+
+        p = os.path.normcase(os.path.normpath(os.path.join(root, path)))
+        return not (p == root.rstrip(os.sep) or p.startswith(root))
+
     except (OSError, ValueError):
         return False
 

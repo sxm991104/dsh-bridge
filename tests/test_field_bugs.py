@@ -446,3 +446,103 @@ def test_perm_code_bound_to_window(isolated):
             "A 的码竟然能改 B"
     finally:
         guard.send_code_email = old_send
+
+# ══════════════════════════════════════════════════════
+# 7. 跨平台：路径判断不能依赖当前系统
+# ══════════════════════════════════════════════════════
+
+def test_is_outside_platform_independent():
+    """盘符路径和 POSIX 绝对路径，在哪个平台上都算越界。
+
+    当时怎么炸的：
+        有人拉下来在 Linux 上跑测试，报 "echo. > D:/important.txt" 没拦住。
+        他以为是真漏洞。
+
+        真相：
+            在 Windows 上   D:/ 是绝对路径      → 判成越界 → 拦
+            在 Linux 上     D:/ 只是普通文件名  → 判成没越界 → 不拦
+
+        差异不在安全逻辑，在"谁在解析这个字符串"。
+
+        命令最终在哪执行、按哪个平台的规则解析，才是要紧的。
+        这个项目主要跑 Windows，所以看到盘符就按 Windows 规则判——
+        哪怕测试跑在 Linux 上。
+    """
+    import tempfile
+
+    import action_guard as ag
+
+    w = tempfile.mkdtemp()
+
+    # 这些不管在哪个系统上都该判成"跑出去了"
+    must_be_outside = [
+        "D:/important.txt",
+        "C:\\Windows\\evil.txt",
+        "/etc/passwd",
+        "~/secret",
+        "../outside.txt",
+    ]
+    for p in must_be_outside:
+        assert ag.is_outside(p, w), f"{p} 应该算越界"
+
+
+def test_is_outside_relative_stays_inside():
+    """普通相对路径不算越界。
+
+    这条防的是另一种错：把 abspath 当成相对工作目录。
+
+        os.path.abspath("a.txt") 按的是 **进程的 cwd**，
+        不是任务的工作目录。于是 "a.txt" 被解析成 <仓库>/a.txt，
+        跟任务目录完全不同 → 判成越界 → 每一条正常写都误伤。
+
+    相对路径的基准永远是任务的工作目录。
+    """
+    import tempfile
+
+    import action_guard as ag
+
+    w = tempfile.mkdtemp()
+
+    for p in ("a.txt", "sub/b.txt", "./x.md", "deep/nested/file.py"):
+        assert not ag.is_outside(p, w), f"{p} 不该算越界"
+
+
+def test_echo_redirect_blocked_outside():
+    """echo. > 工作区外的文件，必须拦。
+
+    这是外部实测报的那条"真漏洞"。
+    在第一版的实现里它确实没被拦住——
+    destructive_move_or_truncate 管住了 move，没管 > 重定向截断。
+    """
+    import json
+    import tempfile
+
+    from engine import agent, tools
+
+    w = tempfile.mkdtemp()
+    tools.set_workdir(w)
+    tools.set_level("workspace")
+
+    v = agent._check_action(
+        "run_command",
+        json.dumps({"command": "echo. > D:/important.txt"}),
+    )
+    assert v is not None, "echo 重定向截断没被拦住"
+
+
+def test_echo_redirect_inside_allowed():
+    """在工作区里写文件，不拦。"""
+    import json
+    import tempfile
+
+    from engine import agent, tools
+
+    w = tempfile.mkdtemp()
+    tools.set_workdir(w)
+    tools.set_level("workspace")
+
+    for cmd in ("echo hello > out.txt", "echo hi > sub/a.md"):
+        v = agent._check_action(
+            "run_command", json.dumps({"command": cmd})
+        )
+        assert v is None, f"{cmd} 不该拦"
