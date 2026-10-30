@@ -760,6 +760,26 @@ def normalize_path(path: str) -> str:
     p = (path or "").strip().strip('"')
     if not p:
         return ""
+
+    # ⚠️ NUL 字节（\x00）显式拒绝。
+    #
+    #    红队报告里那一条的最后残留：
+    #        ../outside.txt\x00.png
+    #
+    #    实测：执行层（engine/tools.py 的 _resolve）会抛
+    #        ValueError: embedded null byte
+    #    所以外部目录没被写入——**实际是安全的**。
+    #
+    #    但守卫层（_check_action）返回 None，也就是"放行"。
+    #    两层口径不一致：守卫说行，执行层用异常挡住。
+    #
+    #    这属于 F-08 那一类的最后一块：结果是安全的，
+    #    但"安全"是靠另一层兜底，不是靠这一层判断对。
+    #
+    #    显式拒绝之后，两层口径就一致了。
+    if "\x00" in p:
+        return ""
+
     p = os.path.expanduser(p)          # ~/x → C:\Users\me\x
     p = os.path.realpath(p)            # 追掉符号链接 / junction
     p = os.path.normcase(p)            # Windows 上统一大小写

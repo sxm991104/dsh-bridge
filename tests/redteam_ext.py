@@ -447,7 +447,29 @@ P_CASES = [
     ("LEVELS 只有三档", tuple(task_perms.LEVELS) == ("workspace", "home", "full")),
     ("空路径被拒", task_perms.is_allowed("", "full", WORKDIR) is False),
 ]
+# ⚠️ 盘符相关的条目在非 Windows 上要跳过。
+#
+#    "workspace 碰不到 C:\Windows" 和 "home 碰不到别的盘(Z:)" 这两条，
+#    依赖 Windows 的盘符概念。Linux 上没有盘符，
+#    "C:\Windows\x" 和 "Z:\x" 会被当成普通相对路径，
+#    落到工作目录里，于是判成"在工作区内"、允许。
+#
+#    这不是漏洞，是测试用了平台上不存在的东西。
+#
+#    等价的能力在 brute_force.py 里已经按平台分别验过了：
+#        Windows  C 盘 / Z 盘
+#        Linux    /etc / /usr
+#
+#    所以这里直接跳过，不重复测。
+_WIN_ONLY_LABELS = (
+    "workspace 碰不到 C:\Windows",
+    "home 碰不到别的盘",
+)
+
 for label, cond in P_CASES:
+    if not IS_WIN and label in _WIN_ONLY_LABELS:
+        skip(label, "Windows 专属（盘符）")
+        continue
     ok_true(label, cond)
 
 # 前缀混淆：task-red 不该能碰 task-red-evil
