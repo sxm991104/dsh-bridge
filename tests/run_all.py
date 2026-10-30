@@ -46,6 +46,22 @@ def main() -> int:
         print("     python -m pip install pytest")
         return 1
 
+    # 先打环境信息。
+    #
+    # 为什么：CI 失败的时候，第一件想知道的事就是"跑在什么环境里"。
+    # 不打出来，就只能靠猜——今天在这上面浪费了太多时间。
+    import platform as _pf
+
+    print(f"{'=' * 66}")
+    print(f"dsh-bridge 回归测试")
+    print(f"{'=' * 66}")
+    print(f"  平台: {sys.platform} / {_pf.machine()}")
+    print(f"  Python: {sys.version.split()[0]}  ({sys.executable})")
+    print(f"  工作目录: {os.getcwd()}")
+    print(f"  APPDATA: {os.environ.get('APPDATA') or '(未设置)'}")
+    print(f"  HOME: {os.environ.get('HOME') or os.path.expanduser('~')}")
+    print()
+
     t0 = time.time()
 
     # 按模块跑，这样能看到每个模块的统计
@@ -95,10 +111,19 @@ def main() -> int:
 
         if r.returncode != 0:
             failed_modules.append(label)
-            # 只打失败的详情
-            for line in out.splitlines():
-                if line.startswith("FAILED") or line.startswith("ERROR"):
-                    print(f"    {line.strip()}")
+
+            # ⚠️ 原来只打 "FAILED xxx" 这一行，看不到为什么失败。
+            #
+            #    在 CI 里就抓瞎了：只知道哪个测试红了，
+            #    不知道是断言失败、ImportError 还是环境问题。
+            #
+            #    而 CI 日志只能从网页看（API 要 token），
+            #    所以必须把足够的信息打到 stdout 里。
+            #
+            #    现在：失败时打完整的 traceback（最后 40 行）。
+            print(f"    ---- {label} 失败详情 ----")
+            for line in out.splitlines()[-40:]:
+                print(f"    {line}")
         else:
             print("    ✅ 全过")
 
