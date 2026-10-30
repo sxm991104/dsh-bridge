@@ -390,12 +390,36 @@ def main() -> int:
 
     expect("默认是工作区权限",
            task_perms.get_level("任务-1"), "workspace")
-    expect("工作区碰不到 C:\\Windows",
-           task_perms.is_allowed(r"C:\Windows\x", "workspace", workdir), False)
-    expect("home 碰不到别的盘",
-           task_perms.is_allowed(r"Z:\x", "home", workdir), False)
-    expect("full 能碰 C 盘",
-           task_perms.is_allowed(r"C:\Windows\x", "full", workdir), True)
+
+    # ⚠️ 这一组是 Windows 专属的，Linux 上要换一套断言。
+    #
+    #    原来这几条没加平台判断，CI 上挂在"home 碰不到别的盘"：
+    #        is_allowed("Z:\\x", "home", ...) 在 Linux 上返回 True
+    #    因为 Linux 上根本没有盘符这个概念，Z:\x 被当成普通相对路径，
+    #    落到工作目录里 → 判成"在工作区内" → 允许。
+    #
+    #    这不是漏洞，是测试用了不存在的平台概念。
+    #    换成各平台都有意义的东西验证同一件事：
+    #        Windows  别的盘碰不到     → 测盘符隔离
+    #        Linux    别的目录碰不到   → 测根目录下的路径
+    if sys.platform == "win32":
+        expect("工作区碰不到 C 盘",
+               task_perms.is_allowed(r"C:\Windows\x", "workspace", workdir),
+               False)
+        expect("home 碰不到别的盘",
+               task_perms.is_allowed(r"Z:\x", "home", workdir), False)
+        expect("full 能碰 C 盘",
+               task_perms.is_allowed(r"C:\Windows\x", "full", workdir), True)
+    else:
+        expect("工作区碰不到 /etc",
+               task_perms.is_allowed("/etc/passwd", "workspace", workdir),
+               False)
+        expect("home 碰不到 /usr",
+               task_perms.is_allowed("/usr/bin/python3", "home", workdir),
+               False)
+        expect("full 能碰 /etc",
+               task_perms.is_allowed("/etc/passwd", "full", workdir), True)
+
     expect("非法级别被拒", task_perms.set_level("x", "god"), False)
 
     # 前缀混淆：task-1 不该能碰 task-10
