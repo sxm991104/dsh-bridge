@@ -192,6 +192,26 @@ ROUND2 = [
 # ══════════════════════════════════════════════════════
 
 BYPASS = [
+    # ── 有人后来打的这批：拆字 + 编码管道 ──
+    #
+    # 这 5 条在 49 条载荷里穿过去过。根因两个：
+    #
+    #   1~3  拆字
+    #        r""m / r''m / r\m 在 shell 里都等价于 rm，
+    #        而正则看的是字面量。
+    #        修法：describe() 也要过 normalize_for_match（原来只有
+    #        uses_arbitrary_executor 过了，两层各算各的）。
+    #
+    #   4~5  解码后灌进管道
+    #        base64 解码出来是 "rm -rf /"，但字面量里没有 rm。
+    #        修法：不试图解码（解码可以套很多层），
+    #        直接看"解码工具 + 管道"和"管道末端是解释器"这两件事。
+    ("空双引号拆字", 'r""m -rf /important'),
+    ("空单引号拆字", "r''m -rf /important"),
+    ("反斜杠拆字",   r"r\m -rf /important"),
+    ("base64 管道",  "echo cm0gLXJmIC8= | base64 -d | bash"),
+    ("hex 管道",     "echo -e '\\x72\\x6d -rf /' | sh"),
+
     ("大写混写", 'PyThOn -C "1"'),
     ("前导空格", "   python -c 1"),
     ("制表符", "python\t-c\t1"),

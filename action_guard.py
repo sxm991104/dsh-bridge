@@ -85,6 +85,33 @@ _ARBITRARY_EXEC = [
     (r"\b(iex|invoke-expression)\b", "PowerShell 动态执行"),
     (r"-enc(odedcommand)?\s+[A-Za-z0-9+/=]{20,}", "编码执行"),
 
+    # ── 解码后灌进解释器 ──
+    #
+    # ⚠️ 这两条是后打的：49 条载荷里穿过去 2 条。
+    #
+    #     echo cm0gLXJmIC8= | base64 -d | bash
+    #     echo -e '\x72\x6d -rf /' | sh
+    #
+    # 前一条解码出来是 "rm -rf /"，后一条解码出来是 "rm -rf /"。
+    #
+    # 为什么原来的规则没抓住：
+    #     正则看的是**字面量**，而这里真正的命令内容是
+    #     一个 base64 / hex 字符串，字面量里根本没有 rm。
+    #
+    #     而 bash/sh 藏在管道末端——"再套一层 sh"那条要求
+    #     sh 前面紧跟 -c，管道里没有 -c，所以也没匹配上。
+    #
+    # 判据：
+    #     解码工具（base64 -d / xxd -r / certutil -decode …）
+    #     后面接了管道、又接了 shell 或解释器 —— 就是"不可见命令"。
+    #     不试图去解码（解码可以套很多层，永远追不完），
+    #     直接看"有没有发生这件事"。
+    (r"\b(base64|b64decode|openssl\s+enc\s+-d|xxd\s+-r|uuencode|uudecode)"
+     r"\b.*\|", "解码后灌进管道"),
+    (r"\|\s*(bash|sh|zsh|dash|ksh|python\d?|perl|ruby|node|iex|"
+     r"invoke-expression|cmd|powershell|pwsh)\b", "管道末端是解释器"),
+    (r"\bx\d\d", "hex 转义拼命令"),
+
     # 再套一层 shell
     (r"cmd(\.exe)?\s+/c", "再套一层 cmd"),
     (r"\b(bash|sh|zsh)(\.exe)?\s+-c\b", "再套一层 sh"),
@@ -207,6 +234,25 @@ def normalize_for_match(command: str) -> str:
     # 2) 去 caret。
     #    ^ 在 cmd 里是转义符，^x 执行时就是 x。
     c = c.replace("^", "")
+
+    # 2.5) 去反斜杠。
+    #
+    #    shell 里反斜杠是转义符：r\m 等价于 rm，\rm 也等价于 rm。
+    #    攻击者用它把命令名拆碎，正则就匹配不到了。
+    #
+    #    实测穿过去过：r\m -rf /important
+    #
+    #    只处理"不是 Windows 路径分隔符"的情况——
+    #    Windows 路径里的反斜杠有意义（C:\Users\x），
+    #    不能一律删掉，否则 "C:\Windows" 会变成 "C:Windows"。
+    #
+    #    判断方式：如果这个反斜杠后面跟的是字母、而且它前面
+    #    不是盘符或者路径分隔符，就当成转义符删掉。
+    #
+    #    简化做法：把所有"反斜杠+字母"里的反斜杠去掉，
+    #    但保留 "盘符:\" 和 "盘符:/" 这种。
+    if not re.search(r"[a-zA-Z]:[\\/]", c):
+        c = c.replace("\\", "")
 
     # 3) 压空白
     c = re.sub(r"\s+", " ", c)
@@ -515,7 +561,23 @@ def system_damage(command: str) -> list[dict]:
 
 
 def describe(command: str) -> list[dict]:
-    c = (command or "").lower()
+    """一条命令里命中哪些不可逆动作。
+
+    ⚠️ 必须先过 normalize_for_match。
+
+        有人打了一轮，5 条穿过去了，其中 3 条全是同一个原因：
+
+            r""m -rf /important      shell 拼成 rm，正则看到的是 r""m
+            r''m -rf /important      同上
+            r\m -rf /important      反斜杠在 shell 里表转义，等价于 rm
+
+        而 normalize_for_match 早就处理了这些（空引号、反斜杠），
+        只是这里没调用它 —— uses_arbitrary_executor 调了，
+        describe 没调。
+
+        这就是"同一个守卫，几层各算各的"。
+    """
+    c = normalize_for_match((command or "").lower())
     if not c:
         return []
 
